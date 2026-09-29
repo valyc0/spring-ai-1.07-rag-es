@@ -1,0 +1,69 @@
+spring:
+  application:
+    name: demo-ai-es
+
+  # carica .env (formato KEY=VALUE) come se fosse un properties file:
+  # le chiavi API arrivano da li', mai hardcoded in questo file.
+  # 'optional' = se il file non esiste l'app parte lo stesso (le chiavi si prendono dall'env).
+  config:
+    import: optional:file:.env[.properties]
+
+  # lo starter umbrella spring-ai-starter-model-openai porta anche audio/image/moderation:
+  # escludiamo le autoconfigurazioni non usate, cosi' bastano le due chiavi chat + embedding.
+  autoconfigure:
+    exclude:
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioSpeechAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiAudioTranscriptionAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiImageAutoConfiguration
+      - org.springframework.ai.model.openai.autoconfigure.OpenAiModerationAutoConfiguration
+
+  ai:
+    openai:
+      chat:
+        base-url: ${OPENAI_CHAT_BASE_URL:https://api.openai.com}
+        # fallback voluto: la chat e' opzionale. Senza OPENAI_CHAT_API_KEY l'app parte lo stesso
+        # (ingest funziona) e solo /chat va in 401. Se la variabile fosse assente E vuota
+        # l'assertion "api-key must be set" bloccherebbe l'avvio.
+        api-key: ${OPENAI_CHAT_API_KEY:not-configured}
+        # se il base-url NON contiene gia' /v1 usa il default; altrimenti:
+        # completions-path: /v1/chat/completions
+        options:
+          model: ${OPENAI_CHAT_MODEL:gpt-4o-mini}
+          temperature: 0.2
+      # embedding su Jina AI: stesso client OpenAI, endpoint /v1/embeddings di Jina
+      embedding:
+        base-url: ${JINA_BASE_URL:https://api.jina.ai}
+        api-key: ${JINA_API_KEY}
+        embeddings-path: /v1/embeddings
+        options:
+          model: ${JINA_EMBEDDING_MODEL:jina-embeddings-v5-omni-small}
+          # vettore nativo da 1024 dim (Matryoshka: 32/64/128/256/512/768/1024).
+          # se cambi modello (es. nano = 768) aggiorna anche ChunkDocument.EMBEDDING_DIMS
+          dimensions: 1024
+
+  elasticsearch:
+    # container gia' running: docker.elastic.co/elasticsearch/elasticsearch:9.2.1
+    # nome=elasticsearch, rete google-like-search_default, discovery.type=single-node,
+    # xpack.security.enabled=false -> http in chiaro, nessuna credenziale.
+    # se l'app gira in un container nella stessa rete: http://elasticsearch:9200
+    uris: ${ELASTIC_URIS:http://localhost:9200}
+    # username: elastic
+    # password: changeme
+    connection-timeout: 5s
+    socket-timeout: 60s
+
+app:
+  elastic:
+    index: chunks
+  chunk:
+    size: 800
+    overlap: 100
+  http-log:
+    # logga request/response HTTP di Spring AI su logger "http.request" (header Authorization mascherato).
+    # metti false in produzione: il body contiene i testi inviati al provider.
+    enabled: ${HTTP_LOG_ENABLED:true}
+
+logging:
+  level:
+    org.springframework.ai: INFO
+    http.request: ${HTTP_LOG_LEVEL:INFO}
