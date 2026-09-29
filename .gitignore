@@ -33,3 +33,7 @@ info.txt
 
 # file di esempio generato da scripts/curl-examples.sh (SAMPLE_FILE)
 mio_testo.txt
+
+# config locali di tool esterni (contengono API key) e archivi del progetto (includono .env)
+opencode-*.json
+*.tar.gz

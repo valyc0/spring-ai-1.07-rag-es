@@ -42,8 +42,12 @@ public class SearchService {
                          ChatClient.Builder chatClientBuilder,
                          @Value("${app.search.top-k:5}") int topK,
                          @Value("${app.search.num-candidates:50}") int numCandidates,
-                         @Value("${app.search.min-score:1.76}") float minScore,
+                         @Value("${app.search.min-score:0.76}") float minScore,
                          @Value("${app.search.no-answer:Non ho informazioni a riguardo.}") String noAnswer) {
+        if (numCandidates < topK) {
+            throw new IllegalArgumentException(
+                    "app.search.num-candidates (" + numCandidates + ") deve essere >= app.search.top-k (" + topK + ")");
+        }
         this.embeddingModel = embeddingModel;
         this.operations = operations;
         this.chatClient = chatClientBuilder.build();
@@ -56,13 +60,10 @@ public class SearchService {
     public SearchResult search(String question) {
         // 1. embed della domanda (stesso modello usato in ingest, altrimenti i vettori non confrontabili)
         float[] queryVector = embeddingModel.embed(question);
-        // 2. kNN: i chunk piu' vicini alla domanda
-        //    operations.save() non fa refresh (vedi nota 6 del README): senza refresh
-        //    un ingest appena fatto non e' ricercabile e si perderebbero i chunk.
-        operations.indexOps(ChunkDocument.class).refresh();
-
+        // 2. kNN: i chunk piu' vicini alla domanda. Solo knn, senza query: con una query
+        //    (es. match_all) ES SOMMA i due score e la soglia non sarebbe piu' il coseno.
+        //    Il refresh lo fa IngestService dopo il save, non serve rifarlo a ogni ricerca.
         NativeQuery knn = NativeQuery.builder()
-                .withQuery(q -> q.matchAll(m -> m))
                 .withKnnSearches(s -> s
                         .field("embedding")
                         .queryVector(toFloatList(queryVector))

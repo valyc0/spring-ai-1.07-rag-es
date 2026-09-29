@@ -63,18 +63,20 @@ app:
   chunk:
     size: 800
     overlap: 100
+    # quanti chunk per chiamata di embedding (i provider limitano input e token per richiesta)
+    embed-batch-size: 64
   search:
     # top-k = quanti chunk finiscono nel contesto del LLM
     top-k: 5
     # num-candidates = quanti vettori ES valuta prima di ridurli a top-k (deve essere >= top-k)
     num-candidates: 50
     # soglia di rilevanza sul chunk piu' vicino: sotto questa, non si chiede niente
-    # al LLM e si risponde con no-answer. Valutata a mano su 11 sonde (5 con risposta,
-    # 6 senza): con risposta 1.79-1.92, senza 1.69-1.73, quindi 1.76 le separa.
-    # DIPENDE dal modello di embedding: i vettori non sono normalizzati (normalized non
-    # e' esposto, vedi nota 3 del README), quindi il coseno sta su ~1.7-1.9 e non su 0-1.
-    # Cambiando modello o abilitando normalized, rimisurare.
-    min-score: 1.76
+    # al LLM e si risponde con no-answer. Con similarity=cosine lo score kNN di ES e'
+    # (1 + cos) / 2, quindi sta in 0-1 (la normalizzazione dei vettori non conta).
+    # Valutata a mano su 11 sonde (5 con risposta, 6 senza): con risposta 0.79-0.92,
+    # senza 0.69-0.73, quindi 0.76 le separa. DIPENDE dal modello di embedding:
+    # cambiando modello, rimisurare.
+    min-score: 0.76
     no-answer: "Non ho informazioni a riguardo."
   http-log:
     # logga request/response HTTP di Spring AI su logger "http.request" (header Authorization mascherato).

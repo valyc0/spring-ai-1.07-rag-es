@@ -135,8 +135,8 @@ curl -G "localhost:8080/search" --data-urlencode "q=Di che colore sono le pallin
 {
   "answer": "Le palline da tennis sono **verdi** (e lucide)【palline#0】.",
   "sources": [
-    {"source": "palline", "chunkIndex": 0, "score": 1.8779, "content": "Le palline da tennis nel cesto sono verdi e lucide."},
-    {"source": "gatto",   "chunkIndex": 0, "score": 1.6432, "content": "Il gatto dorme tutto il giorno sul tappeto verde in salotto."}
+    {"source": "palline", "chunkIndex": 0, "score": 0.8779, "content": "Le palline da tennis nel cesto sono verdi e lucide."},
+    {"source": "gatto",   "chunkIndex": 0, "score": 0.6432, "content": "Il gatto dorme tutto il giorno sul tappeto verde in salotto."}
   ],
   "chunksUsed": 5
 }
@@ -150,13 +150,15 @@ che non guasta la risposta ma mostra che il kNN è puramente semantico, non a pa
 
 | # | passo | dove |
 |---|---|---|
-| 1 | embed della domanda con lo stesso modello dell'ingest | `SearchService.java:58` |
-| 2 | kNN su `chunks`, `k=top-k`, `num_candidates=num-candidates` | `SearchService.java:64-72` |
-| 3 | soglia di rilevanza sul chunk più vicino | `SearchService.java:80` |
-| 4 | contesto `[source#chunkIndex] testo` → `ChatClient` → risposta | `SearchService.java:86-106` |
+| 1 | embed della domanda con lo stesso modello dell'ingest | `SearchService.java:62` |
+| 2 | kNN su `chunks`, `k=top-k`, `num_candidates=num-candidates` | `SearchService.java:66-73` |
+| 3 | soglia di rilevanza sul chunk più vicino | `SearchService.java:81` |
+| 4 | contesto `[source#chunkIndex] testo` → `ChatClient` → risposta | `SearchService.java:87-107` |
 
-Al passo 2, `operations.indexOps(ChunkDocument.class).refresh()`: senza, un ingest appena
-fatto non è ricercabile (nota 6) e i chunk appena scritti sparirebbero dalla risposta.
+Al passo 2 la richiesta contiene **solo** `knn`, senza `query`: se ci fosse anche una query
+(es. `match_all`) ES sommerebbe i due score e il valore confrontato con `min-score` non sarebbe
+più lo score kNN (vedi "I tre limiti da conoscere"). Il refresh dell'indice lo fa l'ingest dopo
+il `save()` (nota 6), quindi una `/search` subito dopo un ingest trova già i chunk.
 
 **Non serve `spring-ai-starter-vector-store`.** `NativeQuery.withKnnSearches(...)` in
 spring-data-elasticsearch 5.5.4 finisce già in `SearchRequest.knn()`: il kNN è supportato
@@ -167,8 +169,8 @@ strati sopra e un mapping diverso per l'indice.
 
 Il problema che risolve: la kNN **restituisce sempre `top-k` chunk**, anche se nessuno parla
 della domanda. Con l'indice pieno solo di "palline verdi", la ricerca su *"Dove si trova la Torre
-Eiffel?"* restituisce comunque 5 chunk — solo che i "più vicini" segnano ~1.69 quando i giusti
-segnerebbero ~1.89. Sono rumore. Mandarli al LLM è la via classica all'hallucination: il modello
+Eiffel?"* restituisce comunque 5 chunk — solo che i "più vicini" segnano ~0.69 quando i giusti
+segnerebbero ~0.89. Sono rumore. Mandarli al LLM è la via classica all'hallucination: il modello
 vede frasi plausibili più una domanda senza risposta, e risponde inventando.
 
 La guardia taglia a monte, prima che il rumore raggiunga il modello:
@@ -187,7 +189,7 @@ app:
   search:
     top-k: 5
     num-candidates: 50   # >= top-k: quanti vettori ES valuta prima di ridurli
-    min-score: 1.76
+    min-score: 0.76
     no-answer: "Non ho informazioni a riguardo."
 ```
 
@@ -207,20 +209,23 @@ il caso *ambiguo*: chunk sopra soglia ma senza la risposta specifica. Entrambi v
 informazioni su chi abbia vinto"*. Ma è una cortesia del modello, non una garanzia: riscritto il
 prompt può cambiare comportamento. La soglia no.
 
-### Da dove viene 1.76
+### Da dove viene 0.76
 
 Misurato, non indovinato. 11 sonde sullo stesso indice di 5 documenti:
 
 | | score top-1 |
 |---|---|
-| 5 domande con risposta | 1.7955 – 1.9169 |
-| 6 domande senza risposta | 1.6897 – 1.7321 |
+| 5 domande con risposta | 0.7955 – 0.9169 |
+| 6 domande senza risposta | 0.6897 – 0.7321 |
 
-Il gap è tra 1.7321 e 1.7955, quindi 1.76 separa le due popolazioni. Il log mostra ogni
+Il gap è tra 0.7321 e 0.7955, quindi 0.76 separa le due popolazioni. Il log mostra ogni
 rifiuto, utile per rimisurare:
 
+(Le misure originali erano 1.69–1.92 perché la query conteneva anche un `match_all`, che vale
+1.0 e ES lo sommava allo score kNN; tolto il `match_all`, gli stessi valori calano di 1.)
+
 ```
-SearchService : nessun chunk sopra la soglia: top=1.6896982 minScore=1.76 -> Dove si trova la Torre Eiffel?
+SearchService : nessun chunk sopra la soglia: top=0.6896982 minScore=0.76 -> Dove si trova la Torre Eiffel?
 ```
 
 La soglia è tarata su 4 chunk, quindi il margine è netto ma fragile. Su corpus grandi i "cffi"
@@ -229,13 +234,17 @@ rimisurata man mano che l'indice cresce.
 
 ### I tre limiti da conoscere
 
-**Il valore dipende dal modello di embedding.** I vettori **non sono normalizzati**:
-`OpenAiEmbeddingOptions` non espone `normalized` (nota 3), quindi il coseno non sta su 0–1 ma su
-~1.7–1.9 — il prodotto scalare non è diviso per le norme. `1.76` è una misura in questa scala
-specifica. Cambiando modello, o abilitando `normalized: true`, **tutto il numero va rifatto**.
+**Il valore dipende dal modello di embedding.** Con `similarity: cosine` ES restituisce
+`(1 + cos) / 2`, quindi lo score sta su 0–1 e la normalizzazione dei vettori non lo cambia (il
+coseno divide già per le norme). Ma `0.76` è una misura sulla distribuzione di questo modello:
+cambiando modello **tutto il numero va rifatto**.
 
-**La soglia guarda solo il primo risultato.** Se `matchers.get(0)` è a 1.90 ma il secondo è a
-1.30 e contiene la risposta vera, il chunk da 1.30 finisce nel contesto comunque (o peggio,
+**La richiesta deve restare solo kNN.** Se alla `NativeQuery` si aggiunge una `query`, ES somma
+il suo score a quello kNN: con un `match_all` (score 1.0) i valori salgono a 1.7–1.9, **tutte** le domande superano
+`0.76` e il fallback `no-answer` non scatta più.
+
+**La soglia guarda solo il primo risultato.** Se `matchers.get(0)` è a 0.90 ma il secondo è a
+0.30 e contiene la risposta vera, il chunk da 0.30 finisce nel contesto comunque (o peggio,
 viene scartato insieme a `sources`). Con `top-k: 5` non l'ho visto accadere; su corpus più grandi
 va gestito filtrando per chunk invece che per posizione.
 
@@ -344,8 +353,8 @@ ma se aggiungi un `/search` con query reali conviene un `EmbeddingModel` custom 
 `retrieval.passage` in ingest e `retrieval.query` in ricerca (la retrieval è asimmetrica, usare il
 task sbagliato peggiora i risultati). Nota che `/search` **è** già implemented con query reali ma
 senza task: funziona, però su corpus grandi la qualità del retrieval peggiora. Manca anche
-`normalized`, ed è il motivo per cui la soglia `min-score` sta su ~1.7-1.9 e non su 0-1 (vedi
-sezione sul fallback `no-answer`).
+`normalized`, che però non cambia lo score kNN: con `similarity: cosine` ES divide già per le
+norme.
 
 L'API grezza accetta però tutto quello che il client non espone: per vederlo basta chiamarla
 direttamente con curl, con `task` e `normalized` espliciti:
@@ -401,9 +410,9 @@ Per vederlo in `_source`: `PUT chunks/_settings {"index.mapping.exclude_source_v
 `operations.save()` non fa refresh, quindi il doc non è ricercabile subito: conviene
 `POST /chunks/_refresh` prima di verificare. Un vettore con numero di dim sbagliato viene
 comunque rifiutato da ES con 400 (`different number of dimensions`), quindi gli indici non
-partono. Per questo `SearchService.search()` chiama `indexOps(ChunkDocument.class).refresh()`
-prima della kNN (`SearchService.java:62`): senza, un ingest e una `/search` di seguito perderebbero
-i chunk appena scritti e la demo sembrerebbe rotta.
+partono. Per questo `IngestService.ingest()` chiama `indexOps(ChunkDocument.class).refresh()`
+subito dopo il `save()`: senza, un ingest e una `/search` di seguito perderebbero i chunk appena
+scritti e la demo sembrerebbe rotta.
 
 **7. Elasticsearch: container già running sulla macchina.**
 
