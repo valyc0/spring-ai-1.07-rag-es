@@ -1,6 +1,7 @@
 package com.example.demo;
 
 import com.example.demo.SearchService.SearchResult;
+import com.example.demo.SearchService.GroupedSearchResult;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.http.HttpStatus;
@@ -46,13 +47,34 @@ public class ApiController {
                                @RequestParam(required = false) String contentId,
                                @RequestParam(name = "topic", required = false) List<String> topics,
                                @RequestParam(required = false) String filename) {
-        SearchMode searchMode;
+        return searchService.search(q, parseMode(mode),
+                new SearchFilters(source, langId, contentId, topics, filename));
+    }
+
+    private static SearchMode parseMode(String mode) {
         try {
-            searchMode = SearchMode.valueOf(mode.toUpperCase());
+            return SearchMode.valueOf(mode.toUpperCase());
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "mode deve essere semantic o hybrid");
         }
-        return searchService.search(q, searchMode, new SearchFilters(source, langId, contentId, topics, filename));
+    }
+
+    /**
+     * Come /search ma raggruppa i risultati per contentId (il chunk migliore di ogni documento),
+     * ordinati per score decrescente. answer=true chiede al LLM una risposta per documento:
+     * /search/grouped?q=...&mode=hybrid&answer=true&langId=it&topic=errori
+     */
+    @GetMapping("/search/grouped")
+    public GroupedSearchResult searchGrouped(@RequestParam String q,
+                                             @RequestParam(defaultValue = "semantic") String mode,
+                                             @RequestParam(defaultValue = "false") boolean answer,
+                                             @RequestParam(required = false) String source,
+                                             @RequestParam(required = false) String langId,
+                                             @RequestParam(required = false) String contentId,
+                                             @RequestParam(name = "topic", required = false) List<String> topics,
+                                             @RequestParam(required = false) String filename) {
+        return searchService.searchGrouped(q, parseMode(mode),
+                new SearchFilters(source, langId, contentId, topics, filename), answer);
     }
 
     /** Ingest con metadati: body JSON {source, text, langId, contentId, topics[], filename}. */
