@@ -227,6 +227,31 @@ public class SearchService {
         }
     }
 
+    /**
+     * Raggruppa per contentId tenendo i migliori {chunksPerGroup} chunk di ogni documento.
+     * Presuppone {ranked} ordinato per score decrescente: il primo chunk di ogni gruppo e' il
+     * suo top, e l'ordine di prima comparsa e' l'ordine dei gruppi per score. answer resta null.
+     */
+    static List<GroupHit> group(List<ChunkHit> ranked, int chunksPerGroup, int maxGroups) {
+        Map<String, List<ChunkHit>> byContent = new LinkedHashMap<>();
+        for (ChunkHit hit : ranked) {
+            List<ChunkHit> chunks = byContent.computeIfAbsent(hit.contentId(), k -> new ArrayList<>());
+            if (chunks.size() < chunksPerGroup) {
+                chunks.add(hit);
+            }
+        }
+        return byContent.values().stream()
+                .limit(maxGroups)
+                .map(chunks -> toGroup(chunks, null))
+                .toList();
+    }
+
+    private static GroupHit toGroup(List<ChunkHit> chunks, String answer) {
+        ChunkHit top = chunks.get(0);
+        return new GroupHit(top.contentId(), top.source(), top.langId(), top.topics(),
+                top.filename(), top.score(), chunks, answer);
+    }
+
     private static List<Float> toFloatList(float[] vector) {
         List<Float> list = new ArrayList<>(vector.length);
         for (float v : vector) {
@@ -248,6 +273,10 @@ public class SearchService {
                     doc.getContent(), doc.getLangId(), doc.getContentId(), doc.getTopics(), doc.getFilename());
         }
     }
+
+    /** Un contentId: il suo miglior chunk (score = top del gruppo) + i chunk di contesto e la risposta. */
+    public record GroupHit(String contentId, String source, String langId, List<String> topics,
+                           String filename, float score, List<ChunkHit> chunks, String answer) {}
 
     public record SearchResult(String answer, SearchMode mode, List<ChunkHit> sources, int chunksUsed) {}
 }
