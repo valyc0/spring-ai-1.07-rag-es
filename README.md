@@ -9,10 +9,13 @@ embedding).
 pom.xml
 src/main/java/com/example/demo
 ├── DemoApplication.java
-├── ChunkDocument.java            entity con setEmbedding, @Field(dense_vector)
-├── ElasticIndexInitializer.java  crea l'indice col mapping se non esiste
-├── IngestService.java            split -> embed(List<String>) -> save
-├── SearchService.java            embed(query) -> kNN -> soglia -> contesto -> LLM
+├── ChunkDocument.java            entity: content, embedding (dense_vector) + metadati keyword
+├── ElasticIndexInitializer.java  crea l'indice col mapping, o aggiunge i campi nuovi se esiste
+├── IngestRequest.java            body JSON di POST /ingest (testo + metadati)
+├── IngestService.java            split -> embed(List<String>) a blocchi -> save -> refresh
+├── SearchFilters.java            filtri sui metadati -> term/terms query
+├── SearchMode.java               SEMANTIC (kNN) | HYBRID (kNN + BM25, RRF)
+├── SearchService.java            embed(query) -> kNN [+ BM25] filtrati -> soglia -> contesto -> LLM
 ├── HttpLoggingConfig.java        logga la request HTTP di chat/embedding
 └── ApiController.java            GET /chat, GET /search, POST /ingest
 src/main/resources/application.yml
@@ -54,9 +57,11 @@ shell, quindi funziona anche in CI o in Docker dove sono già iniettate come var
 
 ## Ingest: curl vs client Java
 
-Stessa identica chiamata all'endpoint `POST /ingest`, che è il codice in
-`ApiController.ingest(@RequestParam String source, @RequestBody String text)`: `source` finisce in
-query string, il testo in body `text/plain` grezzo. Risposta: `{"source":"doc1","chunksIndexed":3}`.
+Stessa identica chiamata all'endpoint `POST /ingest` nella variante **senza metadati**, che è il
+codice in `ApiController.ingestText(@RequestParam String source, @RequestBody String text)`:
+`source` finisce in query string, il testo in body `text/plain` grezzo. Risposta:
+`{"source":"doc1","chunksIndexed":3}`. Per l'ingest con metadati (body JSON) vedi
+"Metadati e filtri" più sotto.
 
 **curl** (file o testo inline)
 
@@ -150,10 +155,10 @@ che non guasta la risposta ma mostra che il kNN è puramente semantico, non a pa
 
 | # | passo | dove |
 |---|---|---|
-| 1 | embed della domanda con lo stesso modello dell'ingest | `SearchService.java:62` |
-| 2 | kNN su `chunks`, `k=top-k`, `num_candidates=num-candidates` | `SearchService.java:66-73` |
-| 3 | soglia di rilevanza sul chunk più vicino | `SearchService.java:81` |
-| 4 | contesto `[source#chunkIndex] testo` → `ChatClient` → risposta | `SearchService.java:87-107` |
+| 1 | embed della domanda con lo stesso modello dell'ingest | `SearchService.java:87` |
+| 2 | kNN filtrato su `chunks` (+ BM25 e RRF in modalità `hybrid`) | `SearchService.java:91-106` |
+| 3 | soglia di rilevanza sullo score kNN del chunk più vicino | `SearchService.java:98` |
+| 4 | contesto `[source#chunkIndex] testo` → `ChatClient` → risposta | `SearchService.java:109-128` |
 
 Al passo 2 la richiesta contiene **solo** `knn`, senza `query`: se ci fosse anche una query
 (es. `match_all`) ES sommerebbe i due score e il valore confrontato con `min-score` non sarebbe
@@ -164,6 +169,85 @@ il `save()` (nota 6), quindi una `/search` subito dopo un ingest trova già i ch
 spring-data-elasticsearch 5.5.4 finisce già in `SearchRequest.knn()`: il kNN è supportato
 nativamente da `ElasticsearchOperations`. Con `VectorStore` avresti la stessa ricerca con più
 strati sopra e un mapping diverso per l'indice.
+
+## Metadati e filtri
+
+Ogni chunk porta, come campi di **primo livello** in `_source` (non sotto un oggetto
+`metadata`), i metadati del documento da cui viene:
+
+| campo | tipo ES | filtro |
+|---|---|---|
+| `source` | keyword | `source=...` |
+| `langId` | keyword | `langId=it` |
+| `contentId` | keyword | `contentId=C-100` |
+| `topics` | keyword (array) | `topic=a&topic=b` (OR: basta uno) |
+| `filename` | keyword | `filename=manuale.pdf` |
+
+Sono `keyword` perché servono come filtri esatti, non per la ricerca full-text: `langId=it` non
+trova `IT`. Tra campi diversi vale AND.
+
+**Ingest con metadati** — body JSON, solo `source` e `text` obbligatori; i metadati vengono
+copiati su ogni chunk del documento:
+
+```bash
+curl -X POST localhost:8080/ingest -H "Content-Type: application/json" -d '{
+  "source": "manuale-it",
+  "text": "Il codice errore E4521 indica che il filtro della lavatrice è intasato...",
+  "langId": "it",
+  "contentId": "C-100",
+  "topics": ["lavatrice", "errori"],
+  "filename": "manuale_lavatrice_it.pdf"
+}'
+```
+
+**Ricerca filtrata** — `mode` è `semantic` (default) o `hybrid`, i filtri sono tutti opzionali:
+
+```bash
+curl -G localhost:8080/search --data-urlencode "q=cosa significa l'errore E4521?" \
+     -d mode=hybrid -d langId=it -d topic=errori -d topic=cucina
+```
+
+Ogni elemento di `sources` riporta i metadati del chunk, `score` (quello usato per
+l'ordinamento), `knnScore` e `bm25Score` (`null` se il chunk non era in quella lista).
+
+**I filtri stanno dentro le query, non in `post_filter`.** Nel kNN vanno in `knn.filter`: ES
+cerca i vicini *solo* tra i chunk che passano i filtri, quindi restituisce comunque `k` risultati.
+Con un post-filter ES troverebbe prima i `k` vicini globali e poi scarterebbe quelli fuori
+filtro, e con filtri selettivi resterebbero zero risultati. Nel BM25 vanno in `bool.filter`, che
+non influisce sullo score.
+
+**Aggiungere campi a un indice esistente.** All'avvio `ElasticIndexInitializer` chiama
+`putMapping()` se l'indice c'è già: ES accetta l'aggiunta di campi nuovi, quindi i metadati si
+aggiungono senza perdere i dati. I chunk indicizzati prima non hanno i metadati e **non passano
+nessun filtro** su quei campi. Cambiare il *tipo* di un campo esistente invece fallisce: lì
+serve `scripts/clear-index.sh --drop` + riavvio + reingest.
+
+### `semantic` vs `hybrid`
+
+- **`semantic`**: solo kNN, `k = top-k`. Trova i chunk che *parlano della stessa cosa*, anche in
+  altre lingue, ma può mancare corrispondenze esatte (codici, sigle, nomi propri).
+- **`hybrid`**: kNN e BM25 su `content`, ciascuno con `rank-window` risultati e gli stessi filtri,
+  fusi con **Reciprocal Rank Fusion**: `score = Σ 1 / (rrf-k + rank)`. RRF usa solo le posizioni,
+  quindi non serve rendere confrontabili score su scale diverse (kNN 0–1, BM25 illimitato). Un
+  chunk primo in entrambe le liste vince; uno presente in una sola lista prende solo quel termine.
+
+**RRF è calcolato nell'app, non da ES.** Sulla licenza *basic* sia il retriever `rrf` sia
+`linear` rispondono `403 current license is non-compliant` (verificato su ES 9.2.1). Due
+richieste + fusione in Java funzionano con qualunque licenza.
+
+**La soglia `min-score` guarda sempre lo score kNN**, anche in `hybrid`: lo score RRF dipende
+solo dalle posizioni (il primo prende sempre ~0.016–0.033) e non dice se il chunk parla davvero
+della domanda. Quindi in `hybrid` una domanda con un match *solo* lessicale (BM25 alto, kNN sotto
+soglia) riceve comunque `no-answer`: è una scelta prudente, perché BM25 con l'analyzer standard
+fa match anche su parole comuni ("di", "che") e da solo non è un buon segnale di rilevanza.
+
+```yaml
+app:
+  search:
+    hybrid:
+      rank-window: 20   # risultati per lista prima della fusione (>= top-k, <= num-candidates)
+      rrf-k: 60         # costante di RRF, stesso default di ES
+```
 
 ## Il fallback `no-answer`
 

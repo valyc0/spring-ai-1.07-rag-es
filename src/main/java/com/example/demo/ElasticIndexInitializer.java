@@ -19,6 +19,11 @@ public class ElasticIndexInitializer implements CommandLineRunner {
         IndexOperations indexOps = operations.indexOps(ChunkDocument.class);
         if (!indexOps.exists()) {
             indexOps.createWithMapping();
+        } else {
+            // indice gia' esistente: aggiunge al mapping i campi nuovi di ChunkDocument
+            // (es. i metadati). ES accetta solo aggiunte: cambiare il tipo di un campo
+            // esistente fallisce, e li' serve drop + reindex (scripts/clear-index.sh --drop).
+            indexOps.putMapping();
         }
     }
 }

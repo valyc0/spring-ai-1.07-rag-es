@@ -78,6 +78,13 @@ app:
     # cambiando modello, rimisurare.
     min-score: 0.76
     no-answer: "Non ho informazioni a riguardo."
+    hybrid:
+      # quanti risultati prende ciascuna lista (kNN e BM25) prima della fusione RRF;
+      # >= top-k, e num-candidates deve essere >= rank-window
+      rank-window: 20
+      # costante k di RRF: score = 1 / (rrf-k + rank). 60 e' il valore standard
+      # (lo stesso default di ES): piu' alto = meno peso alle prime posizioni
+      rrf-k: 60
   http-log:
     # logga request/response HTTP di Spring AI su logger "http.request" (header Authorization mascherato).
     # metti false in produzione: il body contiene i testi inviati al provider.

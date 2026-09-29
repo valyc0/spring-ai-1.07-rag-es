@@ -39,8 +39,9 @@ public class IngestService {
         this.embedBatchSize = embedBatchSize;
     }
 
-    public int ingest(String source, String text) {
-        List<String> chunks = split(text);
+    public int ingest(IngestRequest request) {
+        String source = request.source();
+        List<String> chunks = split(request.text());
         if (chunks.isEmpty()) {
             return 0;
         }
@@ -63,6 +64,12 @@ public class IngestService {
             doc.setSource(source);
             doc.setChunkIndex(i);
             doc.setContent(chunks.get(i));
+            // i metadati del documento valgono per tutti i suoi chunk: li copio su ognuno,
+            // cosi' in ricerca si filtra direttamente sul chunk senza join
+            doc.setLangId(request.langId());
+            doc.setContentId(request.contentId());
+            doc.setTopics(request.topics());
+            doc.setFilename(request.filename());
             doc.setEmbedding(embeddings.get(i));
             docs.add(doc);
         }
