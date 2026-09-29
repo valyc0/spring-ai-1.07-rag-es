@@ -14,7 +14,7 @@ src/main/java/com/example/demo
 ├── IngestRequest.java            body JSON di POST /ingest (testo + metadati)
 ├── IngestService.java            split -> embed(List<String>) a blocchi -> save -> refresh
 ├── SearchFilters.java            filtri sui metadati -> term/terms query
-├── SearchMode.java               SEMANTIC (kNN) | HYBRID (kNN + BM25, RRF)
+├── SearchMode.java               SEMANTIC (kNN) | HYBRID (kNN + BM25, RRF) | LEXICAL (solo BM25)
 ├── SearchService.java            embed(query) -> kNN [+ BM25] filtrati -> soglia -> contesto -> LLM
 ├── HttpLoggingConfig.java        logga la request HTTP di chat/embedding
 └── ApiController.java            GET /chat, GET /search, GET /search/grouped, POST /ingest
@@ -31,9 +31,11 @@ Le chiavi si leggono dal file `.env` in locale (nella root del progetto), che è
 cp .env.example .env     # poi riempi JINA_API_KEY
 mvn spring-boot:run
 
-curl -X POST "localhost:8080/ingest?source=doc1" \
-     -H "Content-Type: text/plain" \
-     --data-binary "@mio_testo.txt"
+curl -X POST localhost:8080/ingest -H "Content-Type: application/json" -d '{
+  "source": "doc1",
+  "contentId": "C-doc1",
+  "text": "Un bel tramonto sulla spiaggia."
+}'
 
 curl "localhost:8080/chat?q=ciao"
 ```
@@ -57,22 +59,17 @@ shell, quindi funziona anche in CI o in Docker dove sono già iniettate come var
 
 ## Ingest: curl vs client Java
 
-Stessa identica chiamata all'endpoint `POST /ingest` nella variante **senza metadati**, che è il
-codice in `ApiController.ingestText(@RequestParam String source, @RequestBody String text)`:
-`source` finisce in query string, il testo in body `text/plain` grezzo. Risposta:
-`{"source":"doc1","chunksIndexed":3}`. Per l'ingest con metadati (body JSON) vedi
-"Metadati e filtri" più sotto.
+Chiamata all'endpoint `POST /ingest`, che accetta **solo JSON**: `source`, `contentId` e `text`
+sono obbligatori, `langId`, `topics` e `filename` facoltativi. `contentId` è la chiave con cui
+`/search/grouped` raggruppa i chunk, quindi non può mancare: senza, il documento si perderebbe in
+un gruppo senza nome insieme a tutti gli altri documenti senza `contentId`. Risposta:
+`{"source":"doc1","contentId":"C-doc1","chunksIndexed":3}`.
 
-**curl** (file o testo inline)
+**curl** (testo inline; per un file, leggi il testo e mettilo nel campo `text`)
 
 ```bash
-curl -X POST "localhost:8080/ingest?source=doc1" \
-     -H "Content-Type: text/plain" \
-     --data-binary "@mio_testo.txt"
-
-curl -X POST "localhost:8080/ingest?source=doc1" \
-     -H "Content-Type: text/plain" \
-     --data-binary "Un bel tramonto sulla spiaggia."
+curl -X POST localhost:8080/ingest -H "Content-Type: application/json" \
+     -d "{\"source\":\"doc1\",\"contentId\":\"C-doc1\",\"text\":$(jq -Rs . < mio_testo.txt)}"
 ```
 
 **Java — `RestClient` di Spring 6** (incluso in `spring-boot-starter-web`)
@@ -81,12 +78,14 @@ curl -X POST "localhost:8080/ingest?source=doc1" \
 RestClient client = RestClient.create();
 
 String risposta = client.post()
-        .uri("http://localhost:8080/ingest?source={source}", "doc1")
-        .contentType(MediaType.TEXT_PLAIN)
-        .body("Un bel tramonto sulla spiaggia.")   // .body(Files.readString(Path.of("mio_testo.txt")))
+        .uri("http://localhost:8080/ingest")
+        .contentType(MediaType.APPLICATION_JSON)
+        .body(Map.of("source", "doc1",
+                     "contentId", "C-doc1",
+                     "text", Files.readString(Path.of("mio_testo.txt"))))
         .retrieve()
         .body(String.class);
-// -> {"source":"doc1","chunksIndexed":1}
+// -> {"source":"doc1","contentId":"C-doc1","chunksIndexed":1}
 ```
 
 **Java — vecchia API `RestTemplate`**
@@ -94,10 +93,12 @@ String risposta = client.post()
 ```java
 RestTemplate rest = new RestTemplate();
 String risposta = rest.postForObject(
-        "http://localhost:8080/ingest?source={source}",
-        new HttpEntity<>("Un bel tramonto sulla spiaggia.", headers( MediaType.TEXT_PLAIN)),
-        String.class,
-        Map.of("source", "doc1"));
+        "http://localhost:8080/ingest",
+        new HttpEntity<>(Map.of("source", "doc1",
+                                "contentId", "C-doc1",
+                                "text", "Un bel tramonto sulla spiaggia."),
+                         headers(MediaType.APPLICATION_JSON)),
+        String.class);
 ```
 
 **Java — da un test (MockMvc / `@SpringBootTest(webEnvironment = RANDOM_PORT)`)**
@@ -110,12 +111,13 @@ class IngestApiTest {
 
     @Test
     void ingesta() {
-        IngestResponse r = rest.postForObject("/ingest?source=doc1", "Un bel tramonto sulla spiaggia.",
+        IngestResponse r = rest.postForObject("/ingest", Map.of("source", "doc1",
+                        "contentId", "C-doc1", "text", "Un bel tramonto sulla spiaggia."),
                 IngestResponse.class);
         assertThat(r.chunksIndexed()).isGreaterThan(0);
     }
 
-    record IngestResponse(String source, int chunksIndexed) {}
+    record IngestResponse(String source, String contentId, int chunksIndexed) {}
 }
 ```
 
@@ -129,9 +131,8 @@ in nota 9.
 `GET /search?q=...` chiude il ciclo che `/ingest` aveva solo aperto. Tutto dentro l'app:
 
 ```bash
-curl -X POST "localhost:8080/ingest?source=palline" \
-     -H "Content-Type: text/plain" \
-     --data-binary "Le palline da tennis nel cesto sono verdi e lucide."
+curl -X POST localhost:8080/ingest -H "Content-Type: application/json" \
+     -d '{"source":"palline","contentId":"C-palline","text":"Le palline da tennis nel cesto sono verdi e lucide."}'
 
 curl -G "localhost:8080/search" --data-urlencode "q=Di che colore sono le palline da tennis?"
 ```
@@ -156,8 +157,8 @@ che non guasta la risposta ma mostra che il kNN è puramente semantico, non a pa
 | # | passo | dove |
 |---|---|---|
 | 1 | embed della domanda con lo stesso modello dell'ingest | `SearchService.java:87` |
-| 2 | kNN filtrato su `chunks` (+ BM25 e RRF in modalità `hybrid`) | `SearchService.java:91-106` |
-| 3 | soglia di rilevanza sullo score kNN del chunk più vicino | `SearchService.java:98` |
+| 2 | kNN filtrato su `chunks` (+ BM25 e RRF in modalità `hybrid`; solo BM25 in `lexical`) | `SearchService.java:91-106` |
+| 3 | soglia di rilevanza sullo score kNN del chunk più vicino (sulla soglia BM25 in `lexical`) | `SearchService.java:98` |
 | 4 | contesto `[source#chunkIndex] testo` → `ChatClient` → risposta | `SearchService.java:109-128` |
 
 Al passo 2 la richiesta contiene **solo** `knn`, senza `query`: se ci fosse anche una query
@@ -186,8 +187,8 @@ Ogni chunk porta, come campi di **primo livello** in `_source` (non sotto un ogg
 Sono `keyword` perché servono come filtri esatti, non per la ricerca full-text: `langId=it` non
 trova `IT`. Tra campi diversi vale AND.
 
-**Ingest con metadati** — body JSON, solo `source` e `text` obbligatori; i metadati vengono
-copiati su ogni chunk del documento:
+**Ingest** — body JSON; `source`, `contentId` e `text` obbligatori, gli altri metadati facoltativi.
+I metadati vengono copiati su ogni chunk del documento:
 
 ```bash
 curl -X POST localhost:8080/ingest -H "Content-Type: application/json" -d '{
@@ -200,7 +201,8 @@ curl -X POST localhost:8080/ingest -H "Content-Type: application/json" -d '{
 }'
 ```
 
-**Ricerca filtrata** — `mode` è `semantic` (default) o `hybrid`, i filtri sono tutti opzionali:
+**Ricerca filtrata** — `mode` è `semantic` (default), `hybrid` o `lexical`, i filtri sono tutti
+opzionali:
 
 ```bash
 curl -G localhost:8080/search --data-urlencode "q=cosa significa l'errore E4521?" \
@@ -210,26 +212,62 @@ curl -G localhost:8080/search --data-urlencode "q=cosa significa l'errore E4521?
 Ogni elemento di `sources` riporta i metadati del chunk, `score` (quello usato per
 l'ordinamento), `knnScore` e `bm25Score` (`null` se il chunk non era in quella lista).
 
-**I filtri stanno dentro le query, non in `post_filter`.** Nel kNN vanno in `knn.filter`: ES
-cerca i vicini *solo* tra i chunk che passano i filtri, quindi restituisce comunque `k` risultati.
-Con un post-filter ES troverebbe prima i `k` vicini globali e poi scarterebbe quelli fuori
-filtro, e con filtri selettivi resterebbero zero risultati. Nel BM25 vanno in `bool.filter`, che
-non influisce sullo score.
+### Le tre modalità di ricerca
 
-**Aggiungere campi a un indice esistente.** All'avvio `ElasticIndexInitializer` chiama
-`putMapping()` se l'indice c'è già: ES accetta l'aggiunta di campi nuovi, quindi i metadati si
-aggiungono senza perdere i dati. I chunk indicizzati prima non hanno i metadati e **non passano
-nessun filtro** su quei campi. Cambiare il *tipo* di un campo esistente invece fallisce: lì
-serve `scripts/clear-index.sh --drop` + riavvio + reingest.
+`mode` sceglie **come** viene interpretata la domanda. Sono tre, non due: la terza è `lexical`.
 
-### `semantic` vs `hybrid`
+| | `semantic` (default) | `hybrid` | `lexical` |
+|---|---|---|---|
+| **Come cerca** | solo kNN sul vettore | kNN + BM25, fusi con RRF | solo BM25 su `content` |
+| **Chama il modello di embedding** | sì | sì | **no** |
+| **Costo per richiesta** | 1 embed + 1 ricerca | 1 embed + 2 ricerche | 1 ricerca |
+| **`knnScore`** | valorizzato | valorizzato | **`null`** |
+| **`bm25Score`** | `null` | valorizzato | valorizzato |
+| **Risultati per documento** | fino a `top-k` chunk | fino a `top-k` chunk | **1 solo** |
+| **Soglia** | `min-score` (coseno 0–1) | `min-score` (coseno 0–1) | `lexical.min-score` (score BM25) |
+| **Multilingua** | sì | sì | solo se le parole coincidono |
+| **Cosa ci mette dentro** | `top-k` | `max(rank-window, top-k)` per lista, poi taglia a `top-k` | `top-k`, uno per `contentId` |
 
-- **`semantic`**: solo kNN, `k = top-k`. Trova i chunk che *parlano della stessa cosa*, anche in
-  altre lingue, ma può mancare corrispondenze esatte (codici, sigle, nomi propri).
-- **`hybrid`**: kNN e BM25 su `content`, ciascuno con `rank-window` risultati e gli stessi filtri,
-  fusi con **Reciprocal Rank Fusion**: `score = Σ 1 / (rrf-k + rank)`. RRF usa solo le posizioni,
-  quindi non serve rendere confrontabili score su scale diverse (kNN 0–1, BM25 illimitato). Un
-  chunk primo in entrambe le liste vince; uno presente in una sola lista prende solo quel termine.
+**`semantic`** — solo kNN, `k = top-k`. Confronta la domanda con i vettori: trova i chunk che
+*parlano della stessa cosa*, anche in un'altra lingua, senza che la parola coincida. È la scelta
+giusta quando non sai come è scritto quello che cerchi. Però è solo semantica: può mancare una
+corrispondenza esatta e a volte appiglia un falso positivo, come il chunk sui **palline da
+tennis** che recupera per una domanda sulla lavatrice solo perché contiene la parola *verde*.
+
+**`hybrid`** — kNN e BM25 su `content`, due richieste separate con gli stessi filtri, fuse con
+**Reciprocal Rank Fusion**: `score = Σ 1 / (rrf-k + rank)`. RRF usa solo le posizioni, quindi non
+serve rendere confrontabili score su scale diverse (kNN 0–1, BM25 illimitato). Un chunk primo in
+entrambe le liste vince; uno presente in una sola lista prende solo quel termine. Copre i due
+buchi insieme: il vettore per la similarità, il testo per le corrispondenze esatte.
+
+**`lexical`** — interpreta la domanda come testo da cercare letteralmente in `content`. Nessun
+embedding, quindi `knnScore` è `null` per tutti i chunk e l'ordinamento è quello di ES. **Non
+chiama Jina**: su un corpus grosso, dove `semantic` e `hybrid` chiamano l'embedding a ogni
+richiesta, `lexical` costa solo la ricerca. Rende **un chunk per `contentId`**, quello con score
+BM25 più alto: senza, un documento lungo che matcha la query monopolizzerebbe la lista con i suoi
+chunk e sembrerebbe più pertinente di quanto sia. Serve quando la corrispondenza è letterale e il
+vettore la sbaglia — codici errore (`E4521`), nomi di file, sigle.
+
+Il rovescio: BM25 con l'analyzer standard **non conosce lo stemming**, quindi `lavatrice` e
+`lavatrici` sono due termini distinti. La differenza con `semantic` si sente proprio sulle
+variazioni di forma.
+
+```bash
+curl -G localhost:8080/search --data-urlencode "q=errore E4521" -d mode=lexical
+```
+
+**Quale scegliere, in pratica.** Parti da `semantic`. Passa a `hybrid` se le risposte sbagliano
+perché manca una corrispondenza esatta. Usa `lexical` come terza opzione quando il problema è
+opposto: il vettore sta restituendo documenti che parlano di cose diverse solo perché
+sembrano simili, e ti serve il match esatto. Le tre non sono in gerarchia: sono tre letture
+diverse della stessa domanda, e per questo non c'è un "default migliore" in assoluto.
+
+**La soglia in `lexical` è un'altra soglia** (`app.search.lexical.min-score`, default `0.0`), non
+`min-score`: lo score BM25 è illimitato e dipende dalla lunghezza del campo e dalla frequenza
+dei termini nel corpus, quindi i due numeri non sono confrontabili. Con `0.0` passa tutto quello
+che la query ha trovato, che è già una selezione; alzarla richiede di misurarla sul proprio
+corpus. Attenzione: se la soglia è `0.0` la lista vuota va comunque trattata come *nessun
+risultato*, altrimenti l'LLM riceverebbe un contesto vuoto e risponderebbe a caso.
 
 **RRF è calcolato nell'app, non da ES.** Sulla licenza *basic* sia il retriever `rrf` sia
 `linear` rispondono `403 current license is non-compliant` (verificato su ES 9.2.1). Due
@@ -247,7 +285,21 @@ app:
     hybrid:
       rank-window: 20   # risultati per lista prima della fusione (>= top-k, <= num-candidates)
       rrf-k: 60         # costante di RRF, stesso default di ES
+    lexical:
+      min-score: 0.0    # soglia BM25 della modalita' solo BM25
 ```
+
+**I filtri stanno dentro le query, non in `post_filter`.** Nel kNN vanno in `knn.filter`: ES
+cerca i vicini *solo* tra i chunk che passano i filtri, quindi restituisce comunque `k` risultati.
+Con un post-filter ES troverebbe prima i `k` vicini globali e poi scarterebbe quelli fuori
+filtro, e con filtri selettivi resterebbero zero risultati. Nel BM25 vanno in `bool.filter`, che
+non influisce sullo score.
+
+**Aggiungere campi a un indice esistente.** All'avvio `ElasticIndexInitializer` chiama
+`putMapping()` se l'indice c'è già: ES accetta l'aggiunta di campi nuovi, quindi i metadati si
+aggiungono senza perdere i dati. I chunk indicizzati prima non hanno i metadati e **non passano
+nessun filtro** su quei campi. Cambiare il *tipo* di un campo esistente invece fallisce: lì
+serve `scripts/clear-index.sh --drop` + riavvio + reingest.
 
 ## Risultati raggruppati per documento (`/search/grouped`)
 
@@ -261,12 +313,17 @@ curl -G localhost:8080/search/grouped --data-urlencode "q=cosa significa l'error
      -d mode=hybrid -d langId=it -d answer=true
 ```
 
-- `mode`: `semantic` (default) o `hybrid`; stessi filtri di `/search`.
+- `mode`: `semantic` (default), `hybrid` o `lexical`; stessi filtri di `/search`.
 - `answer=true` (default `false`): chiede al LLM **una risposta per ogni `contentId`**, usando i
   suoi migliori `chunks-per-group` chunk. Le chiamate sono sequenziali: N gruppi = N chiamate.
-- La soglia `min-score` guarda sempre il **miglior kNN globale** (come `/search`): se nessun
-  chunk è sopra soglia, `noAnswer: true` e `groups: []`. In `hybrid` l'ordine è l'RRF, quindi la
-  soglia non si legge sul primo elemento ma sul massimo `knnScore`.
+- La soglia `min-score` è **per chunk**: un chunk sotto soglia non entra nel risultato, né come
+  rappresentante del suo documento né come chunk di contesto. Quindi un documento irrelevante non
+  consuma uno dei posti di `max-groups` e il contesto passato al LLM non contiene pezzi che la
+  soglia aveva escluso. Un documento compare se ha almeno un chunk sopra soglia; se nessuno, la
+  risposta è `noAnswer: true` e `groups: []`. In `hybrid` l'ordine è l'RRF, quindi il
+  rappresentante è il primo chunk **sopra soglia** in ordine RRF, non quello col `knnScore` più
+  alto; i chunk arrivati solo da BM25 non hanno `knnScore` e non passano mai la soglia.
+- Il raggruppamento usa `contentId`, che `/ingest` rende obbligatorio (400 se manca).
 
 Risposta: `groups[]` con `contentId`, metadati del documento, `score` (del suo chunk migliore),
 `chunks[]` (fino a `chunks-per-group`, nell'ordine di ranking) e `answer` (`null` se
@@ -298,6 +355,10 @@ if (matchers.isEmpty() || matchers.get(0).getScore() < minScore) {
 }
 ```
 
+In `lexical` la soglia è un'altra (`lexical.min-score`) e il caso "risultati vuoti" va controllato
+a parte: con soglia `0.0` il confronto da solo lascerebbe passare una lista vuota e l'LLM
+risponderebbe a caso su un contesto escluso.
+
 Configurabile in `application.yml`:
 
 ```yaml
@@ -305,7 +366,7 @@ app:
   search:
     top-k: 5
     num-candidates: 50   # >= top-k: quanti vettori ES valuta prima di ridurli
-    min-score: 0.76
+    min-score: 0.76      # soglia del coseno kNN (mode semantic e hybrid)
     no-answer: "Non ho informazioni a riguardo."
 ```
 
@@ -390,8 +451,8 @@ La domanda più forte è su un contenuto arbitrario, che il modello non può ind
 curl -G "localhost:8080/search" --data-urlencode "q=Di che colore sono le palline da tennis?"
 # -> {"answer":"Non ho informazioni a riguardo.","sources":[],"chunksUsed":0}
 
-curl -X POST "localhost:8080/ingest?source=palline" -H "Content-Type: text/plain" \
-     --data-binary "Le palline da tennis nel cesto sono verdi e lucide."
+curl -X POST localhost:8080/ingest -H "Content-Type: application/json" \
+     -d '{"source":"palline","contentId":"C-palline","text":"Le palline da tennis nel cesto sono verdi e lucide."}'
 
 # stessa domanda, stesso identico testo
 curl -G "localhost:8080/search" --data-urlencode "q=Di che colore sono le palline da tennis?"

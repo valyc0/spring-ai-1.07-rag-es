@@ -25,7 +25,9 @@ import java.util.Map;
  * <ul>
  *   <li>SEMANTIC: solo kNN sul vettore;</li>
  *   <li>HYBRID: kNN + BM25 su content, due richieste separate fuse con RRF qui nell'app,
- *       perche' RRF e retriever linear di ES richiedono una licenza superiore alla basic.</li>
+ *       perche' RRF e retriever linear di ES richiedono una licenza superiore alla basic;</li>
+ *   <li>LEXICAL: solo BM25, senza embedding della domanda, un chunk per contentId. Serve quando
+ *       la corrispondenza e' letterale (codici errore, nomi propri) e il vettore la sbaglia.</li>
  * </ul>
  * In entrambe i filtri stanno DENTRO le query (knn.filter e bool.filter), non in post_filter:
  * cosi' ES cerca i vicini solo tra i chunk che passano i filtri e restituisce comunque k risultati.
@@ -53,6 +55,7 @@ public class SearchService {
     private final int groupWindow;
     private final int maxGroups;
     private final int chunksPerGroup;
+    private final float lexicalMinScore;
 
     public SearchService(EmbeddingModel embeddingModel,
                          ElasticsearchOperations operations,
@@ -65,7 +68,8 @@ public class SearchService {
                          @Value("${app.search.hybrid.rrf-k:60}") int rrfK,
                          @Value("${app.search.grouped.group-window:50}") int groupWindow,
                          @Value("${app.search.grouped.max-groups:10}") int maxGroups,
-                         @Value("${app.search.grouped.chunks-per-group:2}") int chunksPerGroup) {
+                         @Value("${app.search.grouped.chunks-per-group:2}") int chunksPerGroup,
+                         @Value("${app.search.lexical.min-score:0.0}") float lexicalMinScore) {
         if (rankWindow < topK) {
             throw new IllegalArgumentException(
                     "app.search.hybrid.rank-window (" + rankWindow + ") deve essere >= app.search.top-k (" + topK + ")");
@@ -102,17 +106,22 @@ public class SearchService {
         this.groupWindow = groupWindow;
         this.maxGroups = maxGroups;
         this.chunksPerGroup = chunksPerGroup;
+        this.lexicalMinScore = lexicalMinScore;
     }
 
     public SearchResult search(String question, SearchMode mode, SearchFilters filters) {
         Retrieval retrieval = retrieve(question, mode, filters, topK);
 
-        // soglia di rilevanza, sempre sullo score kNN (0-1) anche in HYBRID: lo score RRF
-        // dipende solo dalle posizioni, non dice se il primo chunk parla davvero della domanda.
+        // soglia di rilevanza: sempre sullo score kNN (0-1) anche in HYBRID, perche' lo score RRF
+        // dipende solo dalle posizioni e non dice se il primo chunk parla davvero della domanda.
+        // In LEXICAL non esiste un coseno, quindi la soglia e' quella BM25, su scala diversa.
         // Sotto soglia la risposta e' fissa e NON passa dal LLM: deterministica e senza costo.
-        if (retrieval.knnTop() < minScore) {
-            log.info("nessun chunk sopra la soglia: mode={} top={} minScore={} filters={} -> {}",
-                    mode, retrieval.knnTop(), minScore, filters, question);
+        // Il retrieval vuoto va trattato a parte: con min-score 0 la soglia non lo fermerebbe,
+        // e l'LLM riceverebbe un contesto vuoto.
+        float soglia = minScoreFor(mode);
+        if (retrieval.ranked().isEmpty() || retrieval.topScore() < soglia) {
+            log.info("nessun chunk sopra la soglia: mode={} top={} minScore={} vuoto={} filters={} -> {}",
+                    mode, retrieval.topScore(), soglia, retrieval.ranked().isEmpty(), filters, question);
             return new SearchResult(noAnswer, mode, List.of(), 0);
         }
 
@@ -125,18 +134,18 @@ public class SearchService {
      * Come {@link #search}, ma in risposta raggruppa per contentId: per ogni documento il chunk
      * con score piu' alto, gruppi ordinati per score decrescente, tagliati a max-groups.
      * Con answer=true chiede al LLM una risposta per documento (sui suoi migliori chunks).
-     * La soglia guarda sempre il miglior kNN globale, come in /search.
+     * La soglia e' per chunk: un documento compare solo se ha almeno un chunk sopra min-score, e
+     * nel contesto del gruppo finiscono solo chunk sopra soglia. Se nessun gruppo passa, no-answer.
      */
     public GroupedSearchResult searchGrouped(String question, SearchMode mode, SearchFilters filters, boolean answer) {
         Retrieval retrieval = retrieve(question, mode, filters, groupWindow);
 
-        if (retrieval.knnTop() < minScore) {
-            log.info("nessun chunk sopra la soglia: mode={} top={} minScore={} filters={} -> {}",
-                    mode, retrieval.knnTop(), minScore, filters, question);
+        List<GroupHit> groups = group(retrieval.ranked(), chunksPerGroup, maxGroups, minScoreFor(mode), mode);
+        if (groups.isEmpty()) {
+            log.info("nessun gruppo sopra la soglia: mode={} minScore={} filters={} -> {}",
+                    mode, minScoreFor(mode), filters, question);
             return new GroupedSearchResult(question, mode, List.of(), 0, true);
         }
-
-        List<GroupHit> groups = group(retrieval.ranked(), chunksPerGroup, maxGroups);
         if (answer) {
             groups = groups.stream()
                     .map(g -> new GroupHit(g.contentId(), g.source(), g.langId(), g.topics(), g.filename(),
@@ -199,8 +208,8 @@ public class SearchService {
         return operations.search(query, ChunkDocument.class).getSearchHits();
     }
 
-    /** Hit kNN del miglior vicino (0 se vuoto) + lista ordinata (kNN in SEMANTIC, RRF in HYBRID). */
-    private record Retrieval(float knnTop, List<ChunkHit> ranked) {}
+    /** Score del primo risultato (0 se vuoto) + lista ordinata: kNN in SEMANTIC, RRF in HYBRID, BM25 in LEXICAL. */
+    private record Retrieval(float topScore, List<ChunkHit> ranked) {}
 
     /**
      * Pipeline di retrieval condivisa: embed -> kNN filtrato (+ BM25 fuso con RRF in HYBRID).
@@ -208,6 +217,13 @@ public class SearchService {
      */
     private Retrieval retrieve(String question, SearchMode mode, SearchFilters filters, int limit) {
         List<Query> filterQueries = filters.toQueries();
+        if (mode == SearchMode.LEXICAL) {
+            // niente embedding: il testo e' gia' nel body della richiesta e una chiamata al
+            // provider di embedding costerebbe senza aggiungere nulla a una ricerca lessicale
+            List<ChunkHit> ranked = bestPerContentId(bm25(question, filterQueries, limit));
+            float top = ranked.isEmpty() ? 0f : ranked.get(0).bm25Score();
+            return new Retrieval(top, ranked);
+        }
         float[] queryVector = embeddingModel.embed(question);
         int pool = mode == SearchMode.HYBRID ? Math.max(rankWindow, limit) : limit;
         List<SearchHit<ChunkDocument>> knnHits = knn(queryVector, filterQueries, pool);
@@ -217,6 +233,24 @@ public class SearchService {
                 ? fuse(knnHits, bm25(question, filterQueries, pool), limit)
                 : knnHits.stream().map(h -> ChunkHit.of(h.getContent(), h.getScore(), h.getScore(), null)).toList();
         return new Retrieval(knnTop, ranked);
+    }
+
+    /**
+     * Un solo chunk per contentId, quello con lo score piu' alto.
+     * <p>
+     * ES restituisce gia' i risultati BM25 in ordine di score decrescente, quindi il primo chunk
+     * incontrato per un contentId e' il suo migliore e i successivi si scartano. Serve perche' senza
+     * un documento lungo che matcha la query monopolizza la lista con i suoi chunk, e un solo
+     * documento con piu' di un chunk sembrerebbe piu' pertinente di quanto sia.
+     */
+    private static List<ChunkHit> bestPerContentId(List<SearchHit<ChunkDocument>> hits) {
+        Map<String, ChunkHit> byContent = new LinkedHashMap<>();
+        for (SearchHit<ChunkDocument> hit : hits) {
+            ChunkDocument doc = hit.getContent();
+            byContent.computeIfAbsent(doc.getContentId(),
+                    id -> ChunkHit.of(doc, hit.getScore(), null, hit.getScore()));
+        }
+        return List.copyOf(byContent.values());
     }
 
     /**
@@ -254,13 +288,34 @@ public class SearchService {
     }
 
     /**
-     * Raggruppa per contentId tenendo i migliori {chunksPerGroup} chunk di ogni documento.
+     * Raggruppa per documento tenendo i migliori {chunksPerGroup} chunk di ciascuno.
      * Presuppone {ranked} ordinato per score decrescente: il primo chunk di ogni gruppo e' il
      * suo top, e l'ordine di prima comparsa e' l'ordine dei gruppi per score. answer resta null.
+     * <p>
+     * La soglia e' per chunk e vale sia per il rappresentante sia per il contesto: un chunk sotto
+     * {minScore} non entra nel gruppo, quindi un documento irrilevante non consuma un posto di
+     * maxGroups e il contesto passato al LLM non contiene pezzi che la soglia aveva escluso.
+     * Un chunk solo BM25 ha knnScore null: non puo' dimostrare somiglianza, quindi non passa.
+     * <p>
+     * In HYBRID il rappresentante e' il primo chunk SOPRA SOGLIA in ordine RRF, non quello col
+     * knnScore piu' alto: score del gruppo e knnScore rispondono a due domande diverse,
+     * "quanto e' in alto nel ranking" e "parla davvero".
+     * <p>
+     * Il raggruppamento usa contentId, che /ingest rende obbligatorio: se un chunk avesse
+     * contentId null diventerebbe la chiave di un gruppo condiviso con tutti gli altri
+     * documenti senza contentId, mescolandone i chunk nel contesto dell'LLM.
      */
-    static List<GroupHit> group(List<ChunkHit> ranked, int chunksPerGroup, int maxGroups) {
+    static List<GroupHit> group(List<ChunkHit> ranked, int chunksPerGroup, int maxGroups, float minScore) {
+        return group(ranked, chunksPerGroup, maxGroups, minScore, SearchMode.SEMANTIC);
+    }
+
+    static List<GroupHit> group(List<ChunkHit> ranked, int chunksPerGroup, int maxGroups,
+                                float minScore, SearchMode mode) {
         Map<String, List<ChunkHit>> byContent = new LinkedHashMap<>();
         for (ChunkHit hit : ranked) {
+            if (!aboveMinScore(hit, minScore, mode)) {
+                continue;
+            }
             List<ChunkHit> chunks = byContent.computeIfAbsent(hit.contentId(), k -> new ArrayList<>());
             if (chunks.size() < chunksPerGroup) {
                 chunks.add(hit);
@@ -270,6 +325,21 @@ public class SearchService {
                 .limit(maxGroups)
                 .map(chunks -> toGroup(chunks, null))
                 .toList();
+    }
+
+    private static boolean aboveMinScore(ChunkHit hit, float minScore, SearchMode mode) {
+        Float score = hit.relevanceScore(mode);
+        return score != null && score >= minScore;
+    }
+
+    /**
+     * Soglia della modalita': il coseno kNN sta in 0-1 ed e' confrontabile con min-score, lo score
+     * BM25 e' illimitato e dipende dalla lunghezza del campo e dalla frequenza dei termini nel
+     * corpus, quindi ha una soglia tutta sua. Vale 0.0 di default: la query match ha gia' escluso
+     * i chunk senza i termini, e un valore alto rischierebbe di scartare tutto.
+     */
+    private float minScoreFor(SearchMode mode) {
+        return mode == SearchMode.LEXICAL ? lexicalMinScore : minScore;
     }
 
     private static GroupHit toGroup(List<ChunkHit> chunks, String answer) {
@@ -297,6 +367,11 @@ public class SearchService {
         static ChunkHit of(ChunkDocument doc, float score, Float knnScore, Float bm25Score) {
             return new ChunkHit(doc.getSource(), doc.getChunkIndex(), score, knnScore, bm25Score,
                     doc.getContent(), doc.getLangId(), doc.getContentId(), doc.getTopics(), doc.getFilename());
+        }
+
+        /** Score su cui si decide la soglia: il BM25 in LEXICAL, il coseno kNN in ogni altro caso. */
+        Float relevanceScore(SearchMode mode) {
+            return mode == SearchMode.LEXICAL ? bm25Score : knnScore;
         }
     }
 

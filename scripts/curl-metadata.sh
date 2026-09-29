@@ -41,23 +41,25 @@ curl -s -X POST "$BASE_URL/ingest" -H "Content-Type: application/json" -d '{
   "filename": "ricette.txt"
 }'
 
-h "ingest JSON con solo i campi obbligatori (source + text, niente metadati)"
+h "ingest JSON con solo i campi obbligatori (source + contentId + text, niente metadati)"
 curl -s -X POST "$BASE_URL/ingest" -H "Content-Type: application/json" -d '{
   "source": "viaggi",
+  "contentId": "C-viaggi",
   "text": "Il treno per Napoli parte dalla stazione centrale alle 8:15 del mattino."
 }'
 
-h "ingest text/plain (vecchio formato: source in query string, niente metadati)"
-curl -s -X POST "$BASE_URL/ingest?source=palline" -H "Content-Type: text/plain" \
-     --data-binary "Le palline da tennis nel cesto sono verdi e lucide."
-
-h "ingest text/plain da file (crea prima il file, es. echo 'testo' > mio_testo.txt)"
-[[ -f mio_testo.txt ]] && curl -s -X POST "$BASE_URL/ingest?source=doc1" -H "Content-Type: text/plain" \
-     --data-binary "@mio_testo.txt"
+h "ingest senza contentId -> 400 (obbligatorio: e' la chiave di raggruppamento di /search/grouped)"
+curl -s -o /dev/null -w 'HTTP %{http_code}' -X POST "$BASE_URL/ingest" \
+     -H "Content-Type: application/json" \
+     -d '{"source": "palline", "text": "Le palline da tennis nel cesto sono verdi e lucide."}'
 
 h "ingest senza source -> 400"
 curl -s -o /dev/null -w 'HTTP %{http_code}' -X POST "$BASE_URL/ingest" \
-     -H "Content-Type: application/json" -d '{"text": "manca source"}'
+     -H "Content-Type: application/json" -d '{"contentId": "C-x", "text": "manca source"}'
+
+h "ingest text/plain non esiste piu' -> 415 (l'endpoint accetta solo JSON)"
+curl -s -o /dev/null -w 'HTTP %{http_code}' -X POST "$BASE_URL/ingest?source=doc1" \
+     -H "Content-Type: text/plain" --data-binary "testo"
 
 # ============================================================== SEARCH SEMANTICA
 

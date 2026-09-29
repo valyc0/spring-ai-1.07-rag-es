@@ -56,7 +56,8 @@ public class ApiController {
         try {
             return SearchMode.valueOf(mode.toUpperCase());
         } catch (IllegalArgumentException e) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "mode deve essere semantic o hybrid");
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "mode deve essere semantic, hybrid o lexical");
         }
     }
 
@@ -78,19 +79,22 @@ public class ApiController {
                 new SearchFilters(source, langId, contentId, topics, filename), answer);
     }
 
-    /** Ingest con metadati: body JSON {source, text, langId, contentId, topics[], filename}. */
+    /**
+     * Ingest con metadati: body JSON {source, text, contentId, langId, topics[], filename}.
+     * <p>
+     * source e contentId sono obbligatori: contentId e' l'unica chiave con cui /search/grouped
+     * raggruppa i chunk, quindi se manca il documento si perderebbe in un gruppo senza nome,
+     * mescolato con altri documenti. langId, topics e filename restano facoltativi.
+     */
     @PostMapping(path = "/ingest", consumes = MediaType.APPLICATION_JSON_VALUE)
     public Map<String, Object> ingest(@RequestBody IngestRequest request) {
         if (request.source() == null || request.source().isBlank()) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "source e' obbligatorio");
         }
+        if (request.contentId() == null || request.contentId().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "contentId e' obbligatorio");
+        }
         int n = ingestService.ingest(request);
-        return Map.of("source", request.source(), "chunksIndexed", n);
-    }
-
-    /** Ingest senza metadati: testo grezzo nel body, source in query string (usato dagli script). */
-    @PostMapping(path = "/ingest", consumes = MediaType.TEXT_PLAIN_VALUE)
-    public Map<String, Object> ingestText(@RequestParam String source, @RequestBody String text) {
-        return ingest(new IngestRequest(source, text, null, null, null, null));
+        return Map.of("source", request.source(), "contentId", request.contentId(), "chunksIndexed", n);
     }
 }

@@ -85,6 +85,12 @@ app:
       # costante k di RRF: score = 1 / (rrf-k + rank). 60 e' il valore standard
       # (lo stesso default di ES): piu' alto = meno peso alle prime posizioni
       rrf-k: 60
+    lexical:
+      # soglia della modalita' solo BM25, sullo score BM25 (non sul coseno kNN: scala diversa,
+      # illimitata e dipendente da lunghezza del campo e frequenza dei termini nel corpus).
+      # 0.0 = passa tutto quello che la query match ha trovato, che e' gia' una selezione.
+      # Alzarla richiede di misurarla sul proprio corpus, come min-score.
+      min-score: 0.0
     grouped:
       # quanti candidati da cui pescare i contentId prima di raggruppare;
       # deve essere <= num-candidates

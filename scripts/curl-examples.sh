@@ -9,7 +9,7 @@
 #   ./scripts/curl-examples.sh index        # solo verifica mapping/documenti
 #   ./scripts/curl-examples.sh knn          # solo ricerca kNN (serve JINA_API_KEY)
 #
-# Override: BASE_URL, ELASTIC_URL, INDEX, SOURCE, SAMPLE_FILE, INLINE_TEXT, QUERY
+# Override: BASE_URL, ELASTIC_URL, INDEX, SOURCE, CONTENT_ID, SAMPLE_FILE, INLINE_TEXT, QUERY
 
 set -euo pipefail
 
@@ -24,16 +24,20 @@ SOURCE="${SOURCE:-doc1}"
 SAMPLE_FILE="${SAMPLE_FILE:-mio_testo.txt}"
 [[ "$SAMPLE_FILE" != /* ]] && SAMPLE_FILE="$PROJECT_ROOT/$SAMPLE_FILE"
 INLINE_TEXT="${INLINE_TEXT:-Un bel tramonto sulla spiaggia.}"
+# contentId dei documenti della demo: obbligatorio, /ingest risponde 400 se manca
+CONTENT_ID="${CONTENT_ID:-C-doc1}"
 # TRAIN_TEXT e' il documento che rende RAG_QUERY rispondibile: senza, /search
 # risponde "il contesto non contiene la risposta" e la demo non dimostra nulla.
 TRAIN_TEXT="${TRAIN_TEXT:-Il treno per Napoli parte dalla stazione centrale alle 8:15 del mattino.}"
 RAG_SOURCE="${RAG_SOURCE:-viaggi}"
+RAG_CONTENT_ID="${RAG_CONTENT_ID:-C-viaggi}"
 RAG_QUERY="${RAG_QUERY:-A che ora parte il treno per Napoli?}"
 # secondo giro RAG: contenuto arbitrario, non un fatto noto. Se il LLM risponde
 # "verdi" la risposta puo' venire SOLO dal chunk appena ingestato: e' la prova
 # che il RAG legge davvero l'indice e non sta indovinando.
 BALLS_TEXT="${BALLS_TEXT:-Le palline da tennis nel cesto sono verdi e lucide.}"
 BALLS_SOURCE="${BALLS_SOURCE:-palline}"
+BALLS_CONTENT_ID="${BALLS_CONTENT_ID:-C-palline}"
 BALLS_QUERY="${BALLS_QUERY:-Di che colore sono le palline da tennis?}"
 # query in francese: serve a mostrare che il vettore e' multilingua (cfr. embed di Jina).
 QUERY="${QUERY:-Un beau coucher de soleil sur la plage}"
@@ -74,38 +78,45 @@ do_health() {
 }
 
 # ------------------------------------------------------------ 2. ingest file
+# contentId e' obbligatorio: e' la chiave con cui /search/grouped raggruppa i chunk.
+# python3 costruisce il body JSON, cosi' il testo viene escapingato correttamente.
+ingest_body() {
+	command -v python3 >/dev/null || fail "python3 serve per costruire il body JSON di /ingest"
+	SOURCE="$1" CONTENT_ID="$2" TEXT="$3" python3 -c \
+		'import json, os; print(json.dumps({"source": os.environ["SOURCE"], "contentId": os.environ["CONTENT_ID"], "text": os.environ["TEXT"]}))'
+}
+
 do_ingest() {
 	if [[ ! -f "$SAMPLE_FILE" ]]; then
 		printf 'Un bel tramonto sulla spiaggia.\nIl gatto dorme sul tappeto.\n' >"$SAMPLE_FILE"
 		note "creato $SAMPLE_FILE di esempio"
 	fi
 	say "POST /ingest da file ($SAMPLE_FILE)"
-	note "curl -X POST \"$BASE_URL/ingest?source=$SOURCE\" \\"
-	note "     -H \"Content-Type: text/plain\" --data-binary \"@$SAMPLE_FILE\""
-	curl -sS -X POST "$BASE_URL/ingest?source=$SOURCE" \
-		-H "Content-Type: text/plain" \
-		--data-binary "@$SAMPLE_FILE" | pretty
+	note "curl -X POST \"$BASE_URL/ingest\" -H \"Content-Type: application/json\" \\"
+	note "     -d '{\"source\": \"$SOURCE\", \"contentId\": \"$CONTENT_ID\", \"text\": \"...\"}'"
+	curl -sS -X POST "$BASE_URL/ingest" \
+		-H "Content-Type: application/json" \
+		--data-binary "$(ingest_body "$SOURCE" "$CONTENT_ID" "$(cat "$SAMPLE_FILE")")" | pretty
 
 	say "POST /ingest con testo inline"
-	note "curl -X POST \"$BASE_URL/ingest?source=$SOURCE\" \\"
-	note "     -H \"Content-Type: text/plain\" --data-binary \"$INLINE_TEXT\""
-	curl -sS -X POST "$BASE_URL/ingest?source=$SOURCE" \
-		-H "Content-Type: text/plain" \
-		--data-binary "$INLINE_TEXT" | pretty
+	curl -sS -X POST "$BASE_URL/ingest" \
+		-H "Content-Type: application/json" \
+		--data-binary "$(ingest_body "$SOURCE" "$CONTENT_ID" "$INLINE_TEXT")" | pretty
 
 	say "POST /ingest del documento che rende rispondibile RAG_QUERY"
-	note "curl -X POST \"$BASE_URL/ingest?source=$RAG_SOURCE\" \\"
-	note "     -H \"Content-Type: text/plain\" --data-binary \"$TRAIN_TEXT\""
-	curl -sS -X POST "$BASE_URL/ingest?source=$RAG_SOURCE" \
-		-H "Content-Type: text/plain" \
-		--data-binary "$TRAIN_TEXT" | pretty
+	curl -sS -X POST "$BASE_URL/ingest" \
+		-H "Content-Type: application/json" \
+		--data-binary "$(ingest_body "$RAG_SOURCE" "$RAG_CONTENT_ID" "$TRAIN_TEXT")" | pretty
 
 	say "POST /ingest di un testo arbitrario (prova che il RAG legge l'indice)"
-	note "curl -X POST \"$BASE_URL/ingest?source=$BALLS_SOURCE\" \\"
-	note "     -H \"Content-Type: text/plain\" --data-binary \"$BALLS_TEXT\""
-	curl -sS -X POST "$BASE_URL/ingest?source=$BALLS_SOURCE" \
-		-H "Content-Type: text/plain" \
-		--data-binary "$BALLS_TEXT" | pretty
+	curl -sS -X POST "$BASE_URL/ingest" \
+		-H "Content-Type: application/json" \
+		--data-binary "$(ingest_body "$BALLS_SOURCE" "$BALLS_CONTENT_ID" "$BALLS_TEXT")" | pretty
+
+	say "POST /ingest senza contentId -> 400 (obbligatorio per /search/grouped)"
+	curl -sS -X POST "$BASE_URL/ingest" \
+		-H "Content-Type: application/json" \
+		--data-binary "$(ingest_body "$SOURCE" "" "$INLINE_TEXT")" | pretty
 }
 
 # ------------------------------------------------- 3. RAG completo (server)
