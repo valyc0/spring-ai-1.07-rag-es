@@ -85,6 +85,14 @@ app:
       # costante k di RRF: score = 1 / (rrf-k + rank). 60 e' il valore standard
       # (lo stesso default di ES): piu' alto = meno peso alle prime posizioni
       rrf-k: 60
+    grouped:
+      # quanti candidati da cui pescare i contentId prima di raggruppare;
+      # deve essere <= num-candidates
+      group-window: 50
+      # quanti contentId distinti restituire al massimo
+      max-groups: 10
+      # quanti chunk di ogni documento finiscono nel contesto della risposta LLM
+      chunks-per-group: 2
   http-log:
     # logga request/response HTTP di Spring AI su logger "http.request" (header Authorization mascherato).
     # metti false in produzione: il body contiene i testi inviati al provider.

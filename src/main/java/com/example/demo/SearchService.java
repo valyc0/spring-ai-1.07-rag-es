@@ -50,6 +50,9 @@ public class SearchService {
     private final String noAnswer;
     private final int rankWindow;
     private final int rrfK;
+    private final int groupWindow;
+    private final int maxGroups;
+    private final int chunksPerGroup;
 
     public SearchService(EmbeddingModel embeddingModel,
                          ElasticsearchOperations operations,
@@ -59,7 +62,10 @@ public class SearchService {
                          @Value("${app.search.min-score:0.76}") float minScore,
                          @Value("${app.search.no-answer:Non ho informazioni a riguardo.}") String noAnswer,
                          @Value("${app.search.hybrid.rank-window:20}") int rankWindow,
-                         @Value("${app.search.hybrid.rrf-k:60}") int rrfK) {
+                         @Value("${app.search.hybrid.rrf-k:60}") int rrfK,
+                         @Value("${app.search.grouped.group-window:50}") int groupWindow,
+                         @Value("${app.search.grouped.max-groups:10}") int maxGroups,
+                         @Value("${app.search.grouped.chunks-per-group:2}") int chunksPerGroup) {
         if (rankWindow < topK) {
             throw new IllegalArgumentException(
                     "app.search.hybrid.rank-window (" + rankWindow + ") deve essere >= app.search.top-k (" + topK + ")");
@@ -68,6 +74,21 @@ public class SearchService {
         if (numCandidates < rankWindow) {
             throw new IllegalArgumentException("app.search.num-candidates (" + numCandidates
                     + ") deve essere >= app.search.hybrid.rank-window (" + rankWindow + ")");
+        }
+        if (groupWindow < 1) {
+            throw new IllegalArgumentException("app.search.grouped.group-window (" + groupWindow + ") deve essere >= 1");
+        }
+        // il kNN in /search/grouped chiede group-window vicini, che non possono superare num-candidates
+        if (groupWindow > numCandidates) {
+            throw new IllegalArgumentException("app.search.grouped.group-window (" + groupWindow
+                    + ") deve essere <= app.search.num-candidates (" + numCandidates + ")");
+        }
+        if (maxGroups < 1) {
+            throw new IllegalArgumentException("app.search.grouped.max-groups (" + maxGroups + ") deve essere >= 1");
+        }
+        if (chunksPerGroup < 1) {
+            throw new IllegalArgumentException(
+                    "app.search.grouped.chunks-per-group (" + chunksPerGroup + ") deve essere >= 1");
         }
         this.embeddingModel = embeddingModel;
         this.operations = operations;
@@ -78,44 +99,37 @@ public class SearchService {
         this.noAnswer = noAnswer;
         this.rankWindow = rankWindow;
         this.rrfK = rrfK;
+        this.groupWindow = groupWindow;
+        this.maxGroups = maxGroups;
+        this.chunksPerGroup = chunksPerGroup;
     }
 
     public SearchResult search(String question, SearchMode mode, SearchFilters filters) {
-        List<Query> filterQueries = filters.toQueries();
+        Retrieval retrieval = retrieve(question, mode, filters, topK);
 
-        // 1. embed della domanda (stesso modello usato in ingest, altrimenti i vettori non confrontabili)
-        float[] queryVector = embeddingModel.embed(question);
-
-        // 2. kNN filtrato. In HYBRID chiede rank-window vicini invece di top-k: RRF lavora
-        //    sui ranking, e un chunk al 10o posto in kNN ma 1o in BM25 deve poter risalire.
-        List<SearchHit<ChunkDocument>> knnHits =
-                knn(queryVector, filterQueries, mode == SearchMode.HYBRID ? rankWindow : topK);
-
-        // 3. soglia di rilevanza, sempre sullo score kNN (0-1) anche in HYBRID: lo score RRF
-        //    dipende solo dalle posizioni, non dice se il primo chunk parla davvero della domanda.
-        //    Sotto soglia la risposta e' fissa e NON passa dal LLM: deterministica e senza costo.
-        //    Con filtri troppo stretti knnHits e' vuoto e si finisce qui.
-        if (knnHits.isEmpty() || knnHits.get(0).getScore() < minScore) {
-            float top = knnHits.isEmpty() ? 0f : knnHits.get(0).getScore();
+        // soglia di rilevanza, sempre sullo score kNN (0-1) anche in HYBRID: lo score RRF
+        // dipende solo dalle posizioni, non dice se il primo chunk parla davvero della domanda.
+        // Sotto soglia la risposta e' fissa e NON passa dal LLM: deterministica e senza costo.
+        if (retrieval.knnTop() < minScore) {
             log.info("nessun chunk sopra la soglia: mode={} top={} minScore={} filters={} -> {}",
-                    mode, top, minScore, filters, question);
+                    mode, retrieval.knnTop(), minScore, filters, question);
             return new SearchResult(noAnswer, mode, List.of(), 0);
         }
 
-        List<ChunkHit> ranked = mode == SearchMode.HYBRID
-                ? fuse(knnHits, bm25(question, filterQueries))
-                : knnHits.stream().map(h -> ChunkHit.of(h.getContent(), h.getScore(), h.getScore(), null)).toList();
+        List<ChunkHit> ranked = retrieval.ranked();
+        String answer = answerFor(ranked, question);
+        return new SearchResult(answer, mode, ranked, ranked.size());
+    }
 
-        // 4. contesto per il LLM
+    /** Contesto "[source#index] testo" dei chunk dati -> una risposta LLM. */
+    private String answerFor(List<ChunkHit> chunks, String question) {
         StringBuilder context = new StringBuilder();
-        for (ChunkHit hit : ranked) {
+        for (ChunkHit hit : chunks) {
             context.append("[").append(hit.source()).append("#")
                     .append(hit.chunkIndex()).append("] ")
                     .append(hit.content()).append("\n\n");
         }
-
-        // 5. risposta
-        String answer = chatClient.prompt()
+        return chatClient.prompt()
                 .system(SYSTEM_PROMPT)
                 .user(u -> u.text("""
                         Contesto:
@@ -126,8 +140,6 @@ public class SearchService {
                         .param("question", question))
                 .call()
                 .content();
-
-        return new SearchResult(answer, mode, ranked, ranked.size());
     }
 
     // Solo knn, senza query: con una query (es. match_all) ES SOMMA i due score e la soglia
@@ -150,15 +162,35 @@ public class SearchService {
     }
 
     // BM25 su content, con gli stessi filtri in bool.filter (non influiscono sullo score)
-    private List<SearchHit<ChunkDocument>> bm25(String question, List<Query> filterQueries) {
+    private List<SearchHit<ChunkDocument>> bm25(String question, List<Query> filterQueries, int maxResults) {
         Query match = Query.of(q -> q.bool(b -> b
                 .must(m -> m.match(t -> t.field("content").query(question)))
                 .filter(filterQueries)));
         NativeQuery query = NativeQuery.builder()
                 .withQuery(match)
-                .withMaxResults(rankWindow)
+                .withMaxResults(maxResults)
                 .build();
         return operations.search(query, ChunkDocument.class).getSearchHits();
+    }
+
+    /** Hit kNN del miglior vicino (0 se vuoto) + lista ordinata (kNN in SEMANTIC, RRF in HYBRID). */
+    private record Retrieval(float knnTop, List<ChunkHit> ranked) {}
+
+    /**
+     * Pipeline di retrieval condivisa: embed -> kNN filtrato (+ BM25 fuso con RRF in HYBRID).
+     * In HYBRID ogni lista usa {limit} risultati (almeno rank-window), poi la fusione taglia a {limit}.
+     */
+    private Retrieval retrieve(String question, SearchMode mode, SearchFilters filters, int limit) {
+        List<Query> filterQueries = filters.toQueries();
+        float[] queryVector = embeddingModel.embed(question);
+        int pool = mode == SearchMode.HYBRID ? Math.max(rankWindow, limit) : limit;
+        List<SearchHit<ChunkDocument>> knnHits = knn(queryVector, filterQueries, pool);
+        // la lista kNN e' ordinata per score decrescente: il primo e' sempre il kNN piu' alto
+        float knnTop = knnHits.isEmpty() ? 0f : knnHits.get(0).getScore();
+        List<ChunkHit> ranked = mode == SearchMode.HYBRID
+                ? fuse(knnHits, bm25(question, filterQueries, pool), limit)
+                : knnHits.stream().map(h -> ChunkHit.of(h.getContent(), h.getScore(), h.getScore(), null)).toList();
+        return new Retrieval(knnTop, ranked);
     }
 
     /**
@@ -166,7 +198,8 @@ public class SearchService {
      * Usa solo le posizioni, quindi non serve normalizzare score con scale diverse
      * (kNN in 0-1, BM25 illimitato). Un chunk presente in una sola lista prende solo quel termine.
      */
-    private List<ChunkHit> fuse(List<SearchHit<ChunkDocument>> knnHits, List<SearchHit<ChunkDocument>> bm25Hits) {
+    private List<ChunkHit> fuse(List<SearchHit<ChunkDocument>> knnHits,
+                                List<SearchHit<ChunkDocument>> bm25Hits, int limit) {
         Map<String, float[]> scores = new LinkedHashMap<>(); // id -> {rrf, knnScore, bm25Score}
         Map<String, ChunkDocument> docs = new LinkedHashMap<>();
         accumulate(knnHits, 1, scores, docs);
@@ -174,7 +207,7 @@ public class SearchService {
 
         return scores.entrySet().stream()
                 .sorted(Comparator.comparingDouble((Map.Entry<String, float[]> e) -> e.getValue()[0]).reversed())
-                .limit(topK)
+                .limit(limit)
                 .map(e -> {
                     float[] v = e.getValue();
                     return ChunkHit.of(docs.get(e.getKey()), v[0],
