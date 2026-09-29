@@ -121,6 +121,32 @@ public class SearchService {
         return new SearchResult(answer, mode, ranked, ranked.size());
     }
 
+    /**
+     * Come {@link #search}, ma in risposta raggruppa per contentId: per ogni documento il chunk
+     * con score piu' alto, gruppi ordinati per score decrescente, tagliati a max-groups.
+     * Con answer=true chiede al LLM una risposta per documento (sui suoi migliori chunks).
+     * La soglia guarda sempre il miglior kNN globale, come in /search.
+     */
+    public GroupedSearchResult searchGrouped(String question, SearchMode mode, SearchFilters filters, boolean answer) {
+        Retrieval retrieval = retrieve(question, mode, filters, groupWindow);
+
+        if (retrieval.knnTop() < minScore) {
+            log.info("nessun chunk sopra la soglia: mode={} top={} minScore={} filters={} -> {}",
+                    mode, retrieval.knnTop(), minScore, filters, question);
+            return new GroupedSearchResult(question, mode, List.of(), 0, true);
+        }
+
+        List<GroupHit> groups = group(retrieval.ranked(), chunksPerGroup, maxGroups);
+        if (answer) {
+            groups = groups.stream()
+                    .map(g -> new GroupHit(g.contentId(), g.source(), g.langId(), g.topics(), g.filename(),
+                            g.score(), g.chunks(), answerFor(g.chunks(), question)))
+                    .toList();
+        }
+        int chunksUsed = groups.stream().mapToInt(g -> g.chunks().size()).sum();
+        return new GroupedSearchResult(question, mode, groups, chunksUsed, false);
+    }
+
     /** Contesto "[source#index] testo" dei chunk dati -> una risposta LLM. */
     private String answerFor(List<ChunkHit> chunks, String question) {
         StringBuilder context = new StringBuilder();
@@ -279,4 +305,8 @@ public class SearchService {
                            String filename, float score, List<ChunkHit> chunks, String answer) {}
 
     public record SearchResult(String answer, SearchMode mode, List<ChunkHit> sources, int chunksUsed) {}
+
+    /** groups = un elemento per contentId; noAnswer = true quando nessun gruppo passa la soglia. */
+    public record GroupedSearchResult(String query, SearchMode mode, List<GroupHit> groups,
+                                      int chunksUsed, boolean noAnswer) {}
 }
