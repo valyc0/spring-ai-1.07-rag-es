@@ -17,7 +17,7 @@ src/main/java/com/example/demo
 ├── SearchMode.java               SEMANTIC (kNN) | HYBRID (kNN + BM25, RRF)
 ├── SearchService.java            embed(query) -> kNN [+ BM25] filtrati -> soglia -> contesto -> LLM
 ├── HttpLoggingConfig.java        logga la request HTTP di chat/embedding
-└── ApiController.java            GET /chat, GET /search, POST /ingest
+└── ApiController.java            GET /chat, GET /search, GET /search/grouped, POST /ingest
 src/main/resources/application.yml
 scripts/curl-examples.sh          demo completa: ingest, search, index, knn, chat
 scripts/search.sh                 singola chiamata /search con request, response e timing
@@ -247,6 +247,38 @@ app:
     hybrid:
       rank-window: 20   # risultati per lista prima della fusione (>= top-k, <= num-candidates)
       rrf-k: 60         # costante di RRF, stesso default di ES
+```
+
+## Risultati raggruppati per documento (`/search/grouped`)
+
+`/search` risponde a "quali chunk parlano di X" e passa tutto a un unico prompt. `/search/grouped`
+risponde a "quali *documenti* parlano di X, e ognuno cosa dice": raggruppa i risultati per
+`contentId`, tiene **il chunk con lo score più alto di ogni documento** e ordina i gruppi per
+score decrescente.
+
+```bash
+curl -G localhost:8080/search/grouped --data-urlencode "q=cosa significa l'errore E4521?" \
+     -d mode=hybrid -d langId=it -d answer=true
+```
+
+- `mode`: `semantic` (default) o `hybrid`; stessi filtri di `/search`.
+- `answer=true` (default `false`): chiede al LLM **una risposta per ogni `contentId`**, usando i
+  suoi migliori `chunks-per-group` chunk. Le chiamate sono sequenziali: N gruppi = N chiamate.
+- La soglia `min-score` guarda sempre il **miglior kNN globale** (come `/search`): se nessun
+  chunk è sopra soglia, `noAnswer: true` e `groups: []`. In `hybrid` l'ordine è l'RRF, quindi la
+  soglia non si legge sul primo elemento ma sul massimo `knnScore`.
+
+Risposta: `groups[]` con `contentId`, metadati del documento, `score` (del suo chunk migliore),
+`chunks[]` (fino a `chunks-per-group`, nell'ordine di ranking) e `answer` (`null` se
+`answer=false`); più `chunksUsed` e `noAnswer`.
+
+```yaml
+app:
+  search:
+    grouped:
+      group-window: 50    # candidati da cui pescare i contentId (<= num-candidates)
+      max-groups: 10      # max contentId in risposta
+      chunks-per-group: 2 # chunk del documento usati come contesto LLM (solo con answer=true)
 ```
 
 ## Il fallback `no-answer`

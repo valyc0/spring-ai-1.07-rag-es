@@ -38,6 +38,7 @@ public class ApiController {
     /**
      * RAG con filtri opzionali sui metadati. topic si ripete per piu' valori (OR):
      * /search?q=...&mode=hybrid&langId=it&topic=sport&topic=tennis
+     * Variante raggruppata per contentId: /search/grouped (vedi sotto).
      */
     @GetMapping("/search")
     public SearchResult search(@RequestParam String q,
