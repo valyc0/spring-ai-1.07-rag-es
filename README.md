@@ -169,6 +169,33 @@ ma se aggiungi un `/search` con query reali conviene un `EmbeddingModel` custom 
 `retrieval.passage` in ingest e `retrieval.query` in ricerca (la retrieval è asimmetrica, usare il
 task sbagliato peggiora i risultati).
 
+L'API grezza accetta però tutto quello che il client non espone: per vederlo basta chiamarla
+direttamente con curl, con `task` e `normalized` espliciti:
+
+```bash
+curl "https://api.jina.ai/v1/embeddings" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $JINA_API_KEY" \
+  -d @- <<EOF
+{
+  "model": "jina-embeddings-v5-omni-small",
+  "task": "retrieval.query",
+  "normalized": true,
+  "input": [
+    {"text": "A beautiful sunset over the beach"},
+    {"text": "Un beau coucher de soleil sur la plage"},
+    {"text": "Testo aggiuntivo per la ricerca semantica"},
+    {"text": "Un altro documento da trasformare in embedding"}
+  ]
+}
+EOF
+```
+
+Risposta: `data[]` con un embedding da 1024 float per ciascun testo, in ordine di `input`
+(`index` li numera). Nota che l'`input` qui è un array di oggetti `{"text": ...}`, mentre quello
+che manda Spring AI (nota 9) è un array di stringhe: entrambi validi, sono forme diverse della
+stessa API.
+
 **4. `dims` è una costante di compilazione.**
 Jina v5-omni-small produce 1024 dim (nano = 768; Matryoshka: 32/64/128/256/512/768/1024). Il
 `dims` di `@Field(dense_vector)` non accetta SpEL, quindi è la costante
