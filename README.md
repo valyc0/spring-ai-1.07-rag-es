@@ -1,7 +1,9 @@
 # demo-ai-es
 
-Spring Boot 3.5.6 + Spring AI 1.0.7: chat e embedding su client OpenAI con `base-url` separati,
-chunking + embedding e indicizzazione su Elasticsearch.
+Spring Boot 3.5.6 + Spring AI 1.0.7: RAG su Elasticsearch — ingest con chunking + embedding,
+`/search` che recupera i chunk per similarità e risponde usando solo quelli. Chat ed embedding
+passano entrambi da client OpenAI con `base-url` separati (Groq per la chat, Jina per gli
+embedding).
 
 ```
 pom.xml
@@ -10,9 +12,12 @@ src/main/java/com/example/demo
 ├── ChunkDocument.java            entity con setEmbedding, @Field(dense_vector)
 ├── ElasticIndexInitializer.java  crea l'indice col mapping se non esiste
 ├── IngestService.java            split -> embed(List<String>) -> save
+├── SearchService.java            embed(query) -> kNN -> soglia -> contesto -> LLM
 ├── HttpLoggingConfig.java        logga la request HTTP di chat/embedding
-└── ApiController.java            GET /chat, POST /ingest
+└── ApiController.java            GET /chat, GET /search, POST /ingest
 src/main/resources/application.yml
+scripts/curl-examples.sh          demo completa: ingest, search, index, knn, chat
+scripts/search.sh                 singola chiamata /search con request, response e timing
 ```
 
 ## Avvio
@@ -114,31 +119,201 @@ una sola `embeddingModel.embed(chunks)` (tutti i chunk in una request) →
 `operations.save(docs)` su Elasticsearch. La request HTTP verso Jina che ne esce è quella loggata
 in nota 9.
 
+## `/search`: il RAG completo
+
+`GET /search?q=...` chiude il ciclo che `/ingest` aveva solo aperto. Tutto dentro l'app:
+
+```bash
+curl -X POST "localhost:8080/ingest?source=palline" \
+     -H "Content-Type: text/plain" \
+     --data-binary "Le palline da tennis nel cesto sono verdi e lucide."
+
+curl -G "localhost:8080/search" --data-urlencode "q=Di che colore sono le palline da tennis?"
+```
+
+```json
+{
+  "answer": "Le palline da tennis sono **verdi** (e lucide)【palline#0】.",
+  "sources": [
+    {"source": "palline", "chunkIndex": 0, "score": 1.8779, "content": "Le palline da tennis nel cesto sono verdi e lucide."},
+    {"source": "gatto",   "chunkIndex": 0, "score": 1.6432, "content": "Il gatto dorme tutto il giorno sul tappeto verde in salotto."}
+  ],
+  "chunksUsed": 5
+}
+```
+
+`answer` è la risposta del LLM, `sources` i top-k chunk recuperati con il loro score cosine.
+Il gatto è secondo per una ragione sola: contiene la parola *verde*, ed è un falso positivo
+che non guasta la risposta ma mostra che il kNN è puramente semantico, non a parole chiave.
+
+### I 4 passi (`SearchService.search()`)
+
+| # | passo | dove |
+|---|---|---|
+| 1 | embed della domanda con lo stesso modello dell'ingest | `SearchService.java:58` |
+| 2 | kNN su `chunks`, `k=top-k`, `num_candidates=num-candidates` | `SearchService.java:64-72` |
+| 3 | soglia di rilevanza sul chunk più vicino | `SearchService.java:80` |
+| 4 | contesto `[source#chunkIndex] testo` → `ChatClient` → risposta | `SearchService.java:86-106` |
+
+Al passo 2, `operations.indexOps(ChunkDocument.class).refresh()`: senza, un ingest appena
+fatto non è ricercabile (nota 6) e i chunk appena scritti sparirebbero dalla risposta.
+
+**Non serve `spring-ai-starter-vector-store`.** `NativeQuery.withKnnSearches(...)` in
+spring-data-elasticsearch 5.5.4 finisce già in `SearchRequest.knn()`: il kNN è supportato
+nativamente da `ElasticsearchOperations`. Con `VectorStore` avresti la stessa ricerca con più
+strati sopra e un mapping diverso per l'indice.
+
+## Il fallback `no-answer`
+
+Il problema che risolve: la kNN **restituisce sempre `top-k` chunk**, anche se nessuno parla
+della domanda. Con l'indice pieno solo di "palline verdi", la ricerca su *"Dove si trova la Torre
+Eiffel?"* restituisce comunque 5 chunk — solo che i "più vicini" segnano ~1.69 quando i giusti
+segnerebbero ~1.89. Sono rumore. Mandarli al LLM è la via classica all'hallucination: il modello
+vede frasi plausibili più una domanda senza risposta, e risponde inventando.
+
+La guardia taglia a monte, prima che il rumore raggiunga il modello:
+
+```java
+if (matchers.isEmpty() || matchers.get(0).getScore() < minScore) {
+    log.info("nessun chunk sopra la soglia: top={} minScore={} -> {}", top, minScore, question);
+    return new SearchResult(noAnswer, List.of(), 0);
+}
+```
+
+Configurabile in `application.yml`:
+
+```yaml
+app:
+  search:
+    top-k: 5
+    num-candidates: 50   # >= top-k: quanti vettori ES valuta prima di ridurli
+    min-score: 1.76
+    no-answer: "Non ho informazioni a riguardo."
+```
+
+### Due livelli di difesa, su piani diversi
+
+La soglia è la difesa **deterministica**: sotto, non si chiede niente al LLM.
+Il system prompt è la difesa **probabilistica**:
+
+```
+Rispondi alla domanda usando SOLO il contesto fornito.
+Non usare conoscenze esterne al contesto e non inventare.
+```
+
+La soglia intercetta il caso *chiaro* (nessun chunk parla della domanda). Il prompt intercetta
+il caso *ambiguo*: chunk sopra soglia ma senza la risposta specifica. Entrambi verificati — con
+"campionato 1994" e 5 chunk sopra soglia l'LLM ha risposto *"Il contesto fornito non contiene
+informazioni su chi abbia vinto"*. Ma è una cortesia del modello, non una garanzia: riscritto il
+prompt può cambiare comportamento. La soglia no.
+
+### Da dove viene 1.76
+
+Misurato, non indovinato. 11 sonde sullo stesso indice di 5 documenti:
+
+| | score top-1 |
+|---|---|
+| 5 domande con risposta | 1.7955 – 1.9169 |
+| 6 domande senza risposta | 1.6897 – 1.7321 |
+
+Il gap è tra 1.7321 e 1.7955, quindi 1.76 separa le due popolazioni. Il log mostra ogni
+rifiuto, utile per rimisurare:
+
+```
+SearchService : nessun chunk sopra la soglia: top=1.6896982 minScore=1.76 -> Dove si trova la Torre Eiffel?
+```
+
+La soglia è tarata su 4 chunk, quindi il margine è netto ma fragile. Su corpus grandi i "cffi"
+del rumore salgono e il massimo "senza risposta" può superare il minimo "con risposta": va
+rimisurata man mano che l'indice cresce.
+
+### I tre limiti da conoscere
+
+**Il valore dipende dal modello di embedding.** I vettori **non sono normalizzati**:
+`OpenAiEmbeddingOptions` non espone `normalized` (nota 3), quindi il coseno non sta su 0–1 ma su
+~1.7–1.9 — il prodotto scalare non è diviso per le norme. `1.76` è una misura in questa scala
+specifica. Cambiando modello, o abilitando `normalized: true`, **tutto il numero va rifatto**.
+
+**La soglia guarda solo il primo risultato.** Se `matchers.get(0)` è a 1.90 ma il secondo è a
+1.30 e contiene la risposta vera, il chunk da 1.30 finisce nel contesto comunque (o peggio,
+viene scartato insieme a `sources`). Con `top-k: 5` non l'ho visto accadere; su corpus più grandi
+va gestito filtrando per chunk invece che per posizione.
+
+**Una soglia non fa una garanzia.** Sotto il limite ci sono risposte che troveresti (domanda
+formulata in modo strano, documento che parla della stessa cosa con parole diverse), sopra ci
+sono falsi positivi (domanda generica che matcha con qualsiasi cosa). Ma il danno è una risposta
+mancata, non una risposta falsa: sotto la soglia non si chiede, sopra la soglia si dà contesto
+vero.
+
+### Costo
+
+La guardia evita la completion: l'embedding c'è sempre (serve a cercare), la chiamata LLM no.
+Verificato contando le richieste a Groq nel log — due domande sotto soglia, contatore fermo:
+
+```
+grep -c "api.groq.com" app.log   # 6 -> 6
+```
+
+Su un corpus dove la maggior parte delle domande non trova niente, si azzera il costo dell'LLM.
+
+### Prova che il RAG legge davvero l'indice
+
+La domanda più forte è su un contenuto arbitrario, che il modello non può indovinare:
+
+```bash
+# indice con 3 documenti che NON contengono "palline"
+curl -G "localhost:8080/search" --data-urlencode "q=Di che colore sono le palline da tennis?"
+# -> {"answer":"Non ho informazioni a riguardo.","sources":[],"chunksUsed":0}
+
+curl -X POST "localhost:8080/ingest?source=palline" -H "Content-Type: text/plain" \
+     --data-binary "Le palline da tennis nel cesto sono verdi e lucide."
+
+# stessa domanda, stesso identico testo
+curl -G "localhost:8080/search" --data-urlencode "q=Di che colore sono le palline da tennis?"
+# -> {"answer":"Le palline da tennis sono verdi (e lucide)【palline#0】.", "sources":[{"source":"palline",...}]}
+```
+
+Stessa domanda, risposta opposta, unica variabile cambiata: l'indice. `scripts/curl-examples.sh
+search` fa esattamente questa sequenza con `BALLS_TEXT`/`BALLS_QUERY`.
+
 ### Script pronto all'uso
 
 ```bash
-./scripts/curl-examples.sh              # tutto: health, ingest, indice, kNN, chat
+./scripts/curl-examples.sh              # tutto: health, ingest, indice, search, kNN, chat
 ./scripts/curl-examples.sh ingest       # solo ingest
+./scripts/curl-examples.sh search       # solo il RAG: embed -> kNN -> risposta
 ./scripts/curl-examples.sh index        # mapping dense_vector + conteggio per source
 ./scripts/curl-examples.sh knn          # embed della query con curl a Jina + ricerca kNN
 ./scripts/curl-examples.sh chat         # richiede OPENAI_CHAT_API_KEY
+
+./scripts/search.sh                     # /search con request, response pretty e timing
+./scripts/search.sh "chi ha creato Python?"   # domanda custom
 ```
 
-Sub-comandi: `health | ingest | chat | index | knn | all`. Override da shell: `BASE_URL`,
-`ELASTIC_URL`, `INDEX`, `SOURCE`, `SAMPLE_FILE`, `INLINE_TEXT`, `QUERY`. Lo script crea
-`mio_testo.txt` se non esiste, cerca le chiavi in `.env` e fallisce con un messaggio chiaro se
-manca quella necessaria al sotto-comando.
+Sub-comandi: `health | ingest | search | chat | index | knn | all`. Override da shell: `BASE_URL`,
+`ELASTIC_URL`, `INDEX`, `SOURCE`, `SAMPLE_FILE`, `INLINE_TEXT`, `QUERY`, `TRAIN_TEXT`,
+`RAG_QUERY`, `BALLS_TEXT`, `BALLS_QUERY`. Lo script crea `mio_testo.txt` se non esiste, cerca le
+chiavi in `.env` (root del progetto, poi cwd) e fallisce con un messaggio chiaro se manca quella
+necessaria al sotto-comando.
 
 ## Configurazione
 
 | modello | base-url | api-key | path |
 |---|---|---|---|
-| chat (`gpt-4o-mini`) | `https://api.openai.com` | `OPENAI_CHAT_API_KEY` | `/v1/chat/completions` |
+| chat (`openai/gpt-oss-120b`) | `https://api.groq.com/openai` | `OPENAI_CHAT_API_KEY` | `/v1/chat/completions` (default) |
 | embedding (`jina-embeddings-v5-omni-small`) | `https://api.jina.ai` | `JINA_API_KEY` | `/v1/embeddings` |
 
 Tutte le chiavi/URL sono sovrascrivibili da env (`OPENAI_CHAT_BASE_URL`, `OPENAI_CHAT_MODEL`,
-`JINA_BASE_URL`, `JINA_EMBEDDING_MODEL`, `ELASTIC_URIS`). Se il `base-url` contiene già `/v1`,
-impostare di conseguenza `completions-path` / `embeddings-path`.
+`JINA_BASE_URL`, `JINA_EMBEDDING_MODEL`, `ELASTIC_URIS`). Il `base-url` va **senza** `/v1`: il
+`*-path` di default (`/v1/chat/completions`, `/v1/embeddings`) viene appendito. Per l'embedding
+Jina il default è giusto, perché `https://api.jina.ai` non contiene già `/v1`.
+
+La chat di default non va su OpenAI ma su **Groq**: `openai/gpt-oss-120b` con
+`https://api.groq.com/openai`. Groq espone un'API OpenAI-compatible (stesso path
+`/v1/chat/completions`, stesso body `{"model","messages"}`), quindi serve lo stesso
+`spring-ai-starter-model-openai` — cambiano solo `base-url` e `model`. La chiave Groq va in
+`OPENAI_CHAT_API_KEY` (https://console.groq.com/keys). Per tornare a OpenAI:
+`OPENAI_CHAT_BASE_URL=https://api.openai.com` + `OPENAI_CHAT_MODEL=gpt-4o-mini`.
 
 ## Note emerse in fase di setup
 
@@ -167,7 +342,10 @@ Jina-specifici `task` (`retrieval.query` / `retrieval.passage`) né `normalized`
 sono quindi L2-normalizzati e non applicano l'adapter LoRA per task: va bene per l'indicizzazione,
 ma se aggiungi un `/search` con query reali conviene un `EmbeddingModel` custom che usi
 `retrieval.passage` in ingest e `retrieval.query` in ricerca (la retrieval è asimmetrica, usare il
-task sbagliato peggiora i risultati).
+task sbagliato peggiora i risultati). Nota che `/search` **è** già implemented con query reali ma
+senza task: funziona, però su corpus grandi la qualità del retrieval peggiora. Manca anche
+`normalized`, ed è il motivo per cui la soglia `min-score` sta su ~1.7-1.9 e non su 0-1 (vedi
+sezione sul fallback `no-answer`).
 
 L'API grezza accetta però tutto quello che il client non espone: per vederlo basta chiamarla
 direttamente con curl, con `task` e `normalized` espliciti:
@@ -223,7 +401,9 @@ Per vederlo in `_source`: `PUT chunks/_settings {"index.mapping.exclude_source_v
 `operations.save()` non fa refresh, quindi il doc non è ricercabile subito: conviene
 `POST /chunks/_refresh` prima di verificare. Un vettore con numero di dim sbagliato viene
 comunque rifiutato da ES con 400 (`different number of dimensions`), quindi gli indici non
-partono.
+partono. Per questo `SearchService.search()` chiama `indexOps(ChunkDocument.class).refresh()`
+prima della kNN (`SearchService.java:62`): senza, un ingest e una `/search` di seguito perderebbero
+i chunk appena scritti e la demo sembrerebbe rotta.
 
 **7. Elasticsearch: container già running sulla macchina.**
 

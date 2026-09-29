@@ -4,6 +4,7 @@
 #
 #   ./scripts/curl-examples.sh              # tutto
 #   ./scripts/curl-examples.sh ingest       # solo l'ingest
+#   ./scripts/curl-examples.sh search       # solo il RAG (embed -> kNN -> risposta)
 #   ./scripts/curl-examples.sh chat         # solo la chat (serve OPENAI_CHAT_API_KEY)
 #   ./scripts/curl-examples.sh index        # solo verifica mapping/documenti
 #   ./scripts/curl-examples.sh knn          # solo ricerca kNN (serve JINA_API_KEY)
@@ -18,8 +19,23 @@ BASE_URL="${BASE_URL:-http://localhost:8080}"
 ELASTIC_URL="${ELASTIC_URL:-http://localhost:9200}"
 INDEX="${INDEX:-chunks}"
 SOURCE="${SOURCE:-doc1}"
+# SAMPLE_FILE e' relativo alla root del progetto, non alla cwd: altrimenti lo
+# script genera il file di esempio dove capita e l'ingest non usa lo stesso testo.
 SAMPLE_FILE="${SAMPLE_FILE:-mio_testo.txt}"
+[[ "$SAMPLE_FILE" != /* ]] && SAMPLE_FILE="$PROJECT_ROOT/$SAMPLE_FILE"
 INLINE_TEXT="${INLINE_TEXT:-Un bel tramonto sulla spiaggia.}"
+# TRAIN_TEXT e' il documento che rende RAG_QUERY rispondibile: senza, /search
+# risponde "il contesto non contiene la risposta" e la demo non dimostra nulla.
+TRAIN_TEXT="${TRAIN_TEXT:-Il treno per Napoli parte dalla stazione centrale alle 8:15 del mattino.}"
+RAG_SOURCE="${RAG_SOURCE:-viaggi}"
+RAG_QUERY="${RAG_QUERY:-A che ora parte il treno per Napoli?}"
+# secondo giro RAG: contenuto arbitrario, non un fatto noto. Se il LLM risponde
+# "verdi" la risposta puo' venire SOLO dal chunk appena ingestato: e' la prova
+# che il RAG legge davvero l'indice e non sta indovinando.
+BALLS_TEXT="${BALLS_TEXT:-Le palline da tennis nel cesto sono verdi e lucide.}"
+BALLS_SOURCE="${BALLS_SOURCE:-palline}"
+BALLS_QUERY="${BALLS_QUERY:-Di che colore sono le palline da tennis?}"
+# query in francese: serve a mostrare che il vettore e' multilingua (cfr. embed di Jina).
 QUERY="${QUERY:-Un beau coucher de soleil sur la plage}"
 EMBEDDING_MODEL="${JINA_EMBEDDING_MODEL:-jina-embeddings-v5-omni-small}"
 
@@ -76,6 +92,35 @@ do_ingest() {
 	curl -sS -X POST "$BASE_URL/ingest?source=$SOURCE" \
 		-H "Content-Type: text/plain" \
 		--data-binary "$INLINE_TEXT" | pretty
+
+	say "POST /ingest del documento che rende rispondibile RAG_QUERY"
+	note "curl -X POST \"$BASE_URL/ingest?source=$RAG_SOURCE\" \\"
+	note "     -H \"Content-Type: text/plain\" --data-binary \"$TRAIN_TEXT\""
+	curl -sS -X POST "$BASE_URL/ingest?source=$RAG_SOURCE" \
+		-H "Content-Type: text/plain" \
+		--data-binary "$TRAIN_TEXT" | pretty
+
+	say "POST /ingest di un testo arbitrario (prova che il RAG legge l'indice)"
+	note "curl -X POST \"$BASE_URL/ingest?source=$BALLS_SOURCE\" \\"
+	note "     -H \"Content-Type: text/plain\" --data-binary \"$BALLS_TEXT\""
+	curl -sS -X POST "$BASE_URL/ingest?source=$BALLS_SOURCE" \
+		-H "Content-Type: text/plain" \
+		--data-binary "$BALLS_TEXT" | pretty
+}
+
+# ------------------------------------------------- 3. RAG completo (server)
+#embed della domanda -> kNN su ES -> contesto -> risposta LLM, tutto dentro l'app.
+do_search() {
+	say "GET /search: \"$RAG_QUERY\""
+	note "curl \"$BASE_URL/search?q=...\""
+	curl -sS -G "$BASE_URL/search" --data-urlencode "q=$RAG_QUERY" | pretty
+	note "answer = risposta del LLM, sources = top-k chunk recuperati (source, chunkIndex, score)"
+	note "sources[0] e' il chunk piu' vicino: se la risposta e' buona, e' quello citato"
+
+	say "GET /search: \"$BALLS_QUERY\" (risposta impossibile da sapere senza l'indice)"
+	note "curl \"$BASE_URL/search?q=...\""
+	curl -sS -G "$BASE_URL/search" --data-urlencode "q=$BALLS_QUERY" | pretty
+	note "deve citare $BALLS_SOURCE: se risponde 'verdi', il testo e' stato recuperato dall'indice"
 }
 
 # --------------------------------------------------------------- 3. chat LLM
@@ -143,6 +188,7 @@ do_knn() {
 case "${1:-all}" in
 health) do_health ;;
 ingest) do_ingest ;;
+search) do_search ;;
 chat) do_chat ;;
 index) do_index ;;
 knn) do_knn ;;
@@ -150,8 +196,9 @@ all)
 	do_health
 	do_ingest
 	do_index
+	do_search
 	do_knn
 	do_chat
 	;;
-*) fail "uso: $0 [health|ingest|chat|index|knn|all]" ;;
+*) fail "uso: $0 [health|ingest|search|chat|index|knn|all]" ;;
 esac

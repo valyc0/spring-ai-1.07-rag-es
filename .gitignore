@@ -30,3 +30,6 @@ Thumbs.db
 
 # appunti locali
 info.txt
+
+# file di esempio generato da scripts/curl-examples.sh (SAMPLE_FILE)
+mio_testo.txt

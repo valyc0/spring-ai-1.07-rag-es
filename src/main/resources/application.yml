@@ -20,15 +20,20 @@ spring:
   ai:
     openai:
       chat:
-        base-url: ${OPENAI_CHAT_BASE_URL:https://api.openai.com}
+        # Groq: API OpenAI-compatible, quindi stesso client, solo base-url e model diversi.
+        # ATTENZIONE: base-url senza /v1, perche' il completions-path di default
+        # (/v1/chat/completions) viene APPENDITO. Con /v1 dentro si ottiene
+        # https://api.groq.com/openai/v1/v1/chat/completions -> 404.
+        base-url: ${OPENAI_CHAT_BASE_URL:https://api.groq.com/openai}
         # fallback voluto: la chat e' opzionale. Senza OPENAI_CHAT_API_KEY l'app parte lo stesso
         # (ingest funziona) e solo /chat va in 401. Se la variabile fosse assente E vuota
         # l'assertion "api-key must be set" bloccherebbe l'avvio.
         api-key: ${OPENAI_CHAT_API_KEY:not-configured}
-        # se il base-url NON contiene gia' /v1 usa il default; altrimenti:
-        # completions-path: /v1/chat/completions
+        # il path di default (/v1/chat/completions) e' gia' quello giusto per Groq.
+        # se invece si mette /v1 dentro base-url, va annullato qui:
+        # completions-path: /chat/completions
         options:
-          model: ${OPENAI_CHAT_MODEL:gpt-4o-mini}
+          model: ${OPENAI_CHAT_MODEL:openai/gpt-oss-120b}
           temperature: 0.2
       # embedding su Jina AI: stesso client OpenAI, endpoint /v1/embeddings di Jina
       embedding:
@@ -58,6 +63,19 @@ app:
   chunk:
     size: 800
     overlap: 100
+  search:
+    # top-k = quanti chunk finiscono nel contesto del LLM
+    top-k: 5
+    # num-candidates = quanti vettori ES valuta prima di ridurli a top-k (deve essere >= top-k)
+    num-candidates: 50
+    # soglia di rilevanza sul chunk piu' vicino: sotto questa, non si chiede niente
+    # al LLM e si risponde con no-answer. Valutata a mano su 11 sonde (5 con risposta,
+    # 6 senza): con risposta 1.79-1.92, senza 1.69-1.73, quindi 1.76 le separa.
+    # DIPENDE dal modello di embedding: i vettori non sono normalizzati (normalized non
+    # e' esposto, vedi nota 3 del README), quindi il coseno sta su ~1.7-1.9 e non su 0-1.
+    # Cambiando modello o abilitando normalized, rimisurare.
+    min-score: 1.76
+    no-answer: "Non ho informazioni a riguardo."
   http-log:
     # logga request/response HTTP di Spring AI su logger "http.request" (header Authorization mascherato).
     # metti false in produzione: il body contiene i testi inviati al provider.
