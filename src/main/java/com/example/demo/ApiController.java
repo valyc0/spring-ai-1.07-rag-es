@@ -37,6 +37,11 @@ public class ApiController {
     /**
      * RAG con filtri opzionali sui metadati. topic si ripete per piu' valori (OR):
      * /search?q=...&mode=hybrid&langId=it&topic=sport&topic=tennis
+     * <p>
+     * {@code agentic=true} cambia il percorso: il retrieval diventa un tool e decide il modello
+     * ({@link SearchService#searchAgentic}) invece di girare una volta sola a priori
+     * ({@link SearchService#search}). Piu' ricerche, quindi piu' chiamate al provider e piu'
+     * latenza: e' una scelta per valutare, non il default.
      */
     @GetMapping("/search")
     public SearchResult search(@RequestParam String q,
@@ -45,14 +50,18 @@ public class ApiController {
                                @RequestParam(required = false) String langId,
                                @RequestParam(required = false) String contentId,
                                @RequestParam(name = "topic", required = false) List<String> topics,
-                               @RequestParam(required = false) String filename) {
+                               @RequestParam(required = false) String filename,
+                               @RequestParam(defaultValue = "false") boolean agentic) {
         SearchMode searchMode;
         try {
             searchMode = SearchMode.valueOf(mode.toUpperCase());
         } catch (IllegalArgumentException e) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "mode deve essere semantic o hybrid");
         }
-        return searchService.search(q, searchMode, new SearchFilters(source, langId, contentId, topics, filename));
+        SearchFilters filters = new SearchFilters(source, langId, contentId, topics, filename);
+        return agentic
+                ? searchService.searchAgentic(q, searchMode, filters)
+                : searchService.search(q, searchMode, filters);
     }
 
     /** Ingest con metadati: body JSON {source, text, langId, contentId, topics[], filename}. */

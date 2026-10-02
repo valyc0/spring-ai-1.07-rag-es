@@ -10,14 +10,16 @@ pom.xml
 src/main/java/com/example/demo
 ├── DemoApplication.java
 ├── ChunkDocument.java            entity: content, embedding (dense_vector) + metadati keyword
+├── ChunkRetriever.java           embed -> kNN [+ BM25] filtrati -> soglia -> chunk (non conosce l'LLM)
 ├── ElasticIndexInitializer.java  crea l'indice col mapping, o aggiunge i campi nuovi se esiste
 ├── IngestRequest.java            body JSON di POST /ingest (testo + metadati)
 ├── IngestService.java            split -> embed(List<String>) a blocchi -> save -> refresh
 ├── SearchFilters.java            filtri sui metadati -> term/terms query
 ├── SearchMode.java               SEMANTIC (kNN) | HYBRID (kNN + BM25, RRF)
-├── SearchService.java            embed(query) -> kNN [+ BM25] filtrati -> soglia -> contesto -> LLM
+├── SearchTools.java              RAG agentico: il retrieval come tool, con i filtri del caller
+├── SearchService.java            search() = contesto nel prompt | searchAgentic() = decide il modello
 ├── HttpLoggingConfig.java        logga la request HTTP di chat/embedding
-└── ApiController.java            GET /chat, GET /search, POST /ingest
+└── ApiController.java            GET /chat, GET /search (?agentic), POST /ingest
 src/main/resources/application.yml
 scripts/curl-examples.sh          demo completa: ingest, search, index, knn, chat
 scripts/search.sh                 singola chiamata /search con request, response e timing
@@ -388,6 +390,47 @@ Sub-comandi: `health | ingest | search | chat | index | knn | all`. Override da 
 `RAG_QUERY`, `BALLS_TEXT`, `BALLS_QUERY`. Lo script crea `mio_testo.txt` se non esiste, cerca le
 chiavi in `.env` (root del progetto, poi cwd) e fallisce con un messaggio chiaro se manca quella
 necessaria al sotto-comando.
+
+## RAG agentico: il retrieval come tool
+
+Di default `/search` fa RAG "a priori": l'app esegue **un** giro di retrieval e infila i chunk
+nel prompt. Con `?agentic=true` invece il retrieval diventa il tool `searchChunks` e **decide il
+modello** quando cercare e con quali parole chiave, anche piu volte.
+
+```bash
+curl "localhost:8080/search?q=chi+ha+creato+Python?&mode=hybrid&agentic=true" | jq
+```
+
+Il percorso classico e quello agentico condividono `ChunkRetriever`: stessa soglia, stessi filtri,
+stesso RRF. Cambia solo **chi** decide la ricerca.
+
+**Dove finiscono le fonti.** Nell'agentico non c'''e un "contesto" che l'''app può elencare: le fonti
+sono i chunk che il modello ha **davvero aperto**, raccolti da `SearchTools.usedChunks()` e messi
+nelle `sources` della risposta. `SearchTools` quindi **non è un bean**: viene creato per ogni
+richiesta in `searchAgentic()`. Un singleton sarebbe condiviso fra richieste concurrenti e le fonti
+si mescolerebbero fra utenti diversi.
+
+**I filtri del caller non si negoziano.** `merge()` fa vincere il filtro impostato dall'URL su
+quello che passa il modello: `?langId=it` resta "solo italiano" anche se il modello prova con
+`langId=en`. Il modello può solo **aggiungere** filtri, non toglierli. `contentId` non è esposto al
+tool, quindi è sempre e solo quello del caller.
+
+**Le due protezioni contro le risposte inventate.**
+
+1. `SearchTools` applica la stessa soglia `min-score` del percorso classico e, quando non passa,
+   restituisce al modello un testo che dice esplicitamente "nessun chunk, non ipotizzare", invece
+   di una lista vuota che il modello potrebbe riempire di suo.
+2. Se il modello non ha chiamato **nessun** tool, la risposta non è ancorata a nulla:
+   `searchAgentic()` la scarta e restituisce il `no-answer` di sempre, con un WARN nel log.
+
+**Costo.** `.tools(...)` non è una chiamata sola. Ogni ricerca che il modello decide di fare è un
+nuovo embed + una nuova chiamata al provider, e la cronologia (con i chunk dentro) viene rispedita
+in ogni round. Con `gpt-oss-120b`, che ragiona già, la latenza cresce parecchio: confronta con
+`./scripts/search.sh` prima di metterlo in produzione. Log di ogni giro su logger `com.example.demo.SearchTools`
+a livello DEBUG.
+
+**Nessuna versione nuova richiesta:** i tool (`@Tool`, `@ToolParam`,
+`MethodToolCallbackProvider`) esistono già in Spring AI 1.0.7, e il `pom.xml` resta invariato.
 
 ## Configurazione
 
