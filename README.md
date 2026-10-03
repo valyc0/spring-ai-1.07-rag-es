@@ -3,7 +3,8 @@
 Spring Boot 3.5.6 + Spring AI 1.0.7: RAG su Elasticsearch — ingest con chunking + embedding,
 `/search` che recupera i chunk per similarità e risponde usando solo quelli. Chat ed embedding
 passano entrambi da client OpenAI con `base-url` separati (Groq per la chat, Jina per gli
-embedding).
+embedding). `/agent/chat` espone lo stesso RAG come **tool** e lascia che sia il modello a
+decidere quando e come cercare.
 
 ```
 pom.xml
@@ -16,10 +17,14 @@ src/main/java/com/example/demo
 ├── SearchFilters.java            filtri sui metadati -> term/terms query
 ├── SearchMode.java               SEMANTIC (kNN) | HYBRID (kNN + BM25, RRF) | LEXICAL (solo BM25)
 ├── SearchService.java            embed(query) -> kNN [+ BM25] filtrati -> soglia -> contesto -> LLM
+├── RagTool.java                  @Tool: il RAG come strumento, con traccia delle ricerche
+├── AgentService.java             ChatClient con defaultTools(ragTool) -> ciclo tool calling
 ├── HttpLoggingConfig.java        logga la request HTTP di chat/embedding
-└── ApiController.java            GET /chat, GET /search, GET /search/grouped, POST /ingest
+└── ApiController.java            GET /chat, GET /agent/chat, GET /search, GET /search/grouped, POST /ingest
 src/main/resources/application.yml
 scripts/curl-examples.sh          demo completa: ingest, search, index, knn, chat
+scripts/curl-grouped.sh           /search/grouped: confronto fra documenti
+scripts/curl-agent.sh             /agent/chat: l'agente che decide cosa cercare
 scripts/search.sh                 singola chiamata /search con request, response e timing
 ```
 
@@ -336,6 +341,139 @@ app:
       group-window: 50    # candidati da cui pescare i contentId (<= num-candidates)
       max-groups: 10      # max contentId in risposta
       chunks-per-group: 2 # chunk del documento usati come contesto LLM (solo con answer=true)
+```
+
+## Agente: il RAG come tool (`/agent/chat`)
+
+`/search` è un tubo: la domanda entra, i chunk finiscono nel prompt, e la risposta arriva comunque.
+`/agent/chat` mette lo stesso retrieval nelle mani del modello come **tool**: il modello legge la
+domanda, decide se e come cercare, e risponde con quello che ha trovato.
+
+```bash
+curl -G localhost:8080/agent/chat --data-urlencode "q=cosa significa l'errore E4521 e come si rimuove il filtro?"
+```
+
+```json
+{
+  "answer": "L'errore **E4521** indica che il filtro della lavatrice è intasato. Per risolvere il problema è necessario rimuovere il filtro e pulirlo sotto acqua corrente [manuale-it#0].",
+  "toolCalls": [
+    {"question": "E4521 errore filtro rimuovere", "mode": "semantic", "filters": "langId=it", "chunks": 2}
+  ]
+}
+```
+
+### Il tool
+
+`RagTool` espone un solo metodo `@Tool`, `search_knowledge_base`, che chiama
+`SearchService.chunksAboveThreshold(...)`: la pipeline di `/search` identica (embed → kNN/BM25 →
+soglia) ma **senza la chiamata all'LLM**.
+
+| parametro | a cosa serve |
+|---|---|
+| `question` (obbligatorio) | cosa cercare |
+| `mode` | `semantic` (default), `hybrid`, `lexical` |
+| `source`, `langId`, `contentId`, `topics`, `filename` | gli stessi filtri di `/search`, ma **li sceglie il modello** |
+
+Il ritorno è **testo**, non una risposta:
+
+```
+modalita' semantic, 2 chunk trovati.
+
+[manuale-it#0] Il codice errore E4521 indica che il filtro della lavatrice è intasato: pulirlo sotto acqua corrente.
+
+Fonti: manuale-it#0 (score 0.912, contentId C-100, langId it)
+```
+
+Se niente passa la soglia, il ritorno è `app.agent.empty-result` ("Nessun chunk trovato in indice su
+questo argomento"): è un avviso **al modello**, non una risposta all'utente, e il prompt gli dice di
+riportarlo senza inventare.
+
+**Perché il tool non risponde per conto suo.** Se riusasse `answerFor(...)`, spenderebbe una
+completion dentro il ciclo e restituirebbe un testo già pronto: l'agente non potrebbe più cercare
+nulla, perché l'unica cosa che può fare con una risposta è girarla. Il tool restituisce
+**materiale**, la sintesi la fa il chiamante.
+
+### Il ciclo
+
+`AgentService` costruisce il client con `builder.defaultTools(ragTool)`: il tool è dichiarato una
+volta sola e vale per ogni prompt di quell'agente. Il giro è il function calling classico:
+
+```
+ChatClient.prompt().system(...).user(domanda).call()
+  → il modello risponde con una tool call → il tool gira e il suo testo torna come messaggio tool
+  → il modello usa quel testo come contesto e risponde (o cerca ancora)
+```
+
+`ChatClient.Builder` è un bean **prototype**: il tool vale per il client di `AgentService` e non
+finisce sui client di `/chat` e `/search`, che restano senza tool.
+
+**Costo misurato**, contando le richieste nel log `http.request`:
+
+| ricerche dell'agente | chiamate a Groq | embed a Jina |
+|---|---|---|
+| 1 (5 chunk trovati) | 2 — la tool call e la risposta | 1 |
+| 2 (confronto fra due manuali) | 3 | 2 |
+| 2 tentativi, 0 chunk | 3 | 2 |
+
+N ricerche = N+1 chiamate al modello e N embedding, contro 1+1 di `/search`: il prezzo dell'agente
+si paga nelle ricerche che il modello decide di fare. **Il numero di ricerche non è deterministico**
+— è una scelta del modello, quindi varia da una run all'altra anche a parità di domanda; le tre
+righe sono tre misure, non una formula.
+
+### Cosa decide il modello (misurato su `gpt-oss-120b`)
+
+| domanda all'agente | ricerche fatte |
+|---|---|
+| "cosa significa l'errore E4521 e come si rimuove il filtro?" | 1 ricerca, riscritta in "E4521 errore filtro rimuovere", con `langId=it` |
+| "confronta cosa dice il manuale italiano e quello inglese sull'errore E4521" | 2 ricerche: `langId=it`, poi `langId=en` |
+| "E4521" | 1 ricerca in `mode=lexical` |
+| "Chi ha vinto il campionato di calcio del 1994?" | 1-2 ricerche, 0 chunk in tutte, poi "Non ho trovato alcuna informazione nell'indice" |
+
+L'ultima riga è il caso che conta: **`/chat` sulla stessa domanda risponde "è stato vinto dal
+Brasile"**, perché non ha un indice da cui prendere. Con il RAG come tool l'agente non trova nulla e
+lo dice. Che abbia provato una o due query diverse prima di arrendersi è il comportamento utile (una
+ricerca mancata non è una risposta falsa), ma è anche il caso in cui il costo raddoppia.
+
+### Dove si vede
+
+- `toolCalls` nella risposta: le ricerche in ordine, con `mode`, filtri e quanti chunk ha trovato
+  ciascuna (`chunks: 0` = soglia respinta).
+- log `AgentService`: `agente: 2 ricerche su '...' -> [SearchTrace[question=..., mode=..., filters=..., chunks=2]]`
+- log `http.request`: il JSON con `tools` e i `tool_calls` che il provider ha risposto
+
+### Limiti
+
+- **Serve un modello che faccia tool calling.** `openai/gpt-oss-120b` su Groq lo supporta; un modello
+  senza function calling ignora `tools` e risponde come `/chat`, cioè a memoria.
+- **Nessun tetto ai giri.** Spring AI 1.0.7 esegue i tool finché il modello li chiama: se continua,
+  continua. Il limite è il context window del provider, non un `max-iterations`.
+- **La soglia resta deterministica.** Il tool passa da `chunksAboveThreshold`, quindi sotto
+  `min-score` l'agente non ha nulla su cui inventare. Come in `/search`: la soglia è la difesa
+  vera, il prompt quella probabilistica.
+- **I filtri li può sbagliare.** Un `langId=it` che non esiste nell'indice azzera i risultati e
+  l'agente conclude che non c'è niente. È un rischio che `/search` non ha: lì i filtri li scrive
+  chi conosce i dati, qui li scrive il modello. Se i metadati sono molti e sensibili, meglio o
+  restringere i valori offerti al tool o toglierli e lasciare solo `mode`.
+- **Gli argomenti inventati degradano invece di fallire.** Un `mode` inesistente non è un 400 come
+  su `/search`: `RagTool.modeOrDefault` ricade su `semantic` e la richiesta va avanti. Vale per una
+  `question` vuota (non si chiama l'embedding, si risponde come "non trovato") e per un
+  `topics: [""]`, che viene rimosso: una `terms` query con `""` non matcherebbe nessun chunk e
+  l'agente leggerebbe "non trovato" dove in realtà non aveva filtrato.
+
+### Configurazione
+
+```yaml
+app:
+  agent:
+    empty-result: "Nessun chunk trovato in indice su questo argomento."
+```
+
+Il resto è già in `app.search.*`: il tool usa le stesse impostazioni di `/search` (`top-k`,
+`num-candidates`, `min-score`, `rrf-k`, ...), quindi **nessuna soglia nuova da tarare**.
+
+```bash
+./scripts/curl-agent.sh   # una domanda, un confronto fra documenti, una fuori indice, e /chat come confronto
+                          # stampa richiesta e risposta di ogni caso, come scripts/search.sh
 ```
 
 ## Il fallback `no-answer`

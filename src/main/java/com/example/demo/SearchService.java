@@ -110,6 +110,21 @@ public class SearchService {
     }
 
     public SearchResult search(String question, SearchMode mode, SearchFilters filters) {
+        List<ChunkHit> ranked = chunksAboveThreshold(question, mode, filters);
+        if (ranked.isEmpty()) {
+            return new SearchResult(noAnswer, mode, List.of(), 0);
+        }
+        String answer = answerFor(ranked, question);
+        return new SearchResult(answer, mode, ranked, ranked.size());
+    }
+
+    /**
+     * Chunk recuperati che passano la soglia, senza chiamare l'LLM: e' il contratto del tool RAG
+     * ({@link RagTool}), che restituisce il contesto al ChatClient agentico e lascia a lui la
+     * risposta, e insieme il primo pezzo di {@link #search}, che ci mette sopra il proprio prompt.
+     * Lista vuota se niente passa: il chiamante decide cosa rispondere.
+     */
+    public List<ChunkHit> chunksAboveThreshold(String question, SearchMode mode, SearchFilters filters) {
         Retrieval retrieval = retrieve(question, mode, filters, topK);
 
         // soglia di rilevanza: sempre sullo score kNN (0-1) anche in HYBRID, perche' lo score RRF
@@ -122,12 +137,9 @@ public class SearchService {
         if (retrieval.ranked().isEmpty() || retrieval.topScore() < soglia) {
             log.info("nessun chunk sopra la soglia: mode={} top={} minScore={} vuoto={} filters={} -> {}",
                     mode, retrieval.topScore(), soglia, retrieval.ranked().isEmpty(), filters, question);
-            return new SearchResult(noAnswer, mode, List.of(), 0);
+            return List.of();
         }
-
-        List<ChunkHit> ranked = retrieval.ranked();
-        String answer = answerFor(ranked, question);
-        return new SearchResult(answer, mode, ranked, ranked.size());
+        return retrieval.ranked();
     }
 
     /**

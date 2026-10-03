@@ -2,6 +2,7 @@ package com.example.demo;
 
 import com.example.demo.SearchService.SearchResult;
 import com.example.demo.SearchService.GroupedSearchResult;
+import com.example.demo.AgentService.AgentResult;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.http.HttpStatus;
@@ -22,17 +23,31 @@ public class ApiController {
     private final ChatClient chatClient;
     private final IngestService ingestService;
     private final SearchService searchService;
+    private final AgentService agentService;
 
-    public ApiController(ChatClient.Builder builder, IngestService ingestService, SearchService searchService) {
+    public ApiController(ChatClient.Builder builder, IngestService ingestService, SearchService searchService,
+                         AgentService agentService) {
         this.chatClient = builder.build();
         this.ingestService = ingestService;
         this.searchService = searchService;
+        this.agentService = agentService;
     }
 
+    /** Chat secca, senza indice: serve da confronto con /agent/chat, che invece usa il RAG. */
     @GetMapping("/chat")
     public Map<String, String> chat(@RequestParam String q) {
         String answer = chatClient.prompt().user(q).call().content();
         return Map.of("answer", answer);
+    }
+
+    /**
+     * Agente: il RAG come tool. Il modello decide quando cercare e con quali filtri, e risponde
+     * usando i chunk che il tool restituisce; toolCalls elenca le ricerche fatte.
+     * /agent/chat?q=cosa significa l'errore E4521?
+     */
+    @GetMapping("/agent/chat")
+    public AgentResult agentChat(@RequestParam String q) {
+        return agentService.ask(q);
     }
 
     /**

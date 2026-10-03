@@ -99,6 +99,11 @@ app:
       max-groups: 10
       # quanti chunk di ogni documento finiscono nel contesto della risposta LLM
       chunks-per-group: 2
+  agent:
+    # cosa il tool RAG restituisce all'agente quando nessun chunk passa la soglia: NON e' una
+    # risposta all'utente, e' un avviso al modello, che nel prompt e' istruito a dirlo e a non
+    # inventare. Se qui scrivessi una risposta gia' fatta, l'agente la passerebbe come sua.
+    empty-result: "Nessun chunk trovato in indice su questo argomento."
   http-log:
     # logga request/response HTTP di Spring AI su logger "http.request" (header Authorization mascherato).
     # metti false in produzione: il body contiene i testi inviati al provider.
