@@ -24,7 +24,9 @@ import java.util.stream.Collectors;
  * <p>
  * Filtri e modalita' sono parametri del tool e non valori fissi: e' la differenza rispetto a
  * {@code /search}, dove li sceglie la richiesta HTTP. Con un agente la scelta la fa il modello in
- * base alla domanda (lingua della domanda -&gt; langId, codice errore -&gt; mode=lexical).
+ * base alla domanda (lingua della domanda -&gt; langId, codice errore -&gt; mode=lexical). I filtri
+ * che la richiesta HTTP passa esplicitamente hanno la precedenza su quelli del modello, campo per
+ * campo: chi scrive la richiesta sa quali documenti esistono, il modello no.
  * <p>
  * Ogni invocazione accoda una {@link SearchTrace} alla lista che il chiamante ha messo nel
  * {@link ToolContext}: e' cosi' la risposta HTTP mostra quante e quali ricerche ha fatto
@@ -35,6 +37,9 @@ public class RagTool {
 
     /** Chiave del toolContext sotto cui il chiamante lascia la lista da riempire di {@link SearchTrace}. */
     static final String TRACE_KEY = "ragToolTraces";
+
+    /** Chiave del toolContext sotto cui il chiamante lascia i filtri imposti dalla richiesta HTTP. */
+    static final String FORCED_KEY = "ragForcedFilters";
 
     private static final Logger log = LoggerFactory.getLogger(RagTool.class);
 
@@ -71,7 +76,10 @@ public class RagTool {
         }
 
         SearchMode searchMode = modeOrDefault(mode);
-        SearchFilters filters = new SearchFilters(source, langId, contentId, cleanTopics(topics), filename);
+        // i filtri della richiesta HTTP hanno la precedenza su quelli scelti dal modello:
+        // chi scrive la richiesta sa quali documenti esistono, il modello no
+        SearchFilters filters = forcedFilters(toolContext)
+                .merge(new SearchFilters(source, langId, contentId, cleanTopics(topics), filename));
         List<SearchService.ChunkHit> chunks =
                 searchService.chunksAboveThreshold(question, searchMode, filters);
         trace(toolContext, new SearchTrace(question, searchMode.name().toLowerCase(Locale.ROOT),
@@ -171,6 +179,18 @@ public class RagTool {
             log.info("modalita' non riconosciuta dal modello, uso il default: {}", mode);
             return SearchMode.SEMANTIC;
         }
+    }
+
+    /**
+     * Filtri imposti dalla richiesta HTTP, se il chiamante li ha messi nel toolContext: arrivano
+     * per richiesta, quindi il bean resta senza stato (vedi {@link #FORCED_KEY}). Se mancano,
+     * valgono come assenti e i filtri del modello passano come sono.
+     */
+    private static SearchFilters forcedFilters(ToolContext toolContext) {
+        if (toolContext != null && toolContext.getContext().get(FORCED_KEY) instanceof SearchFilters forced) {
+            return forced;
+        }
+        return new SearchFilters(null, null, null, null, null);
     }
 
     /**

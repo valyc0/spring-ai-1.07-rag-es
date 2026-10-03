@@ -30,6 +30,31 @@ public record SearchFilters(String source,
         return queries;
     }
 
+    /**
+     * Filtri con i valori di questo dove sono valorizzati, quelli di other dove questo manca.
+     * <p>
+     * Serve a /agent/chat: i filtri arrivano da due lati, la richiesta HTTP e la scelta del
+     * modello, e il modello non puo' scavalcare chi ha scritto la richiesta. Campo per campo e
+     * non AND: {@code contentId} e' un valore singolo, quindi i due non possono coesistere e la
+     * precedenza va detta, non lasciata all'ordine dei parametri. topics tiene la lista intera
+     * per la stessa ragione (e non la unione delle due).
+     */
+    public SearchFilters merge(SearchFilters other) {
+        if (other == null) {
+            return this;
+        }
+        return new SearchFilters(
+                firstValued(source, other.source),
+                firstValued(langId, other.langId),
+                firstValued(contentId, other.contentId),
+                topics != null && !topics.isEmpty() ? topics : other.topics,
+                firstValued(filename, other.filename));
+    }
+
+    private static String firstValued(String questo, String altro) {
+        return questo != null && !questo.isBlank() ? questo : altro;
+    }
+
     private static void addTerm(List<Query> queries, String field, String value) {
         if (value != null && !value.isBlank()) {
             queries.add(Query.of(q -> q.term(t -> t.field(field).value(value))));

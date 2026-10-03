@@ -7,6 +7,7 @@ import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -47,26 +48,60 @@ public class AgentService {
             Cita sempre la fonte tra parentesi quadre, nella forma [source#chunkIndex].
             """;
 
+    /**
+     * Righe aggiunte quando la richiesta HTTP ha passato dei filtri. Diciarlo al modello serve per
+     * due motivi: passa i filtri anche lui, quindi non torna a cercare senza, e non racconta di
+     * aver cercato in una lingua o in un documento diverso da quello su cui sta rispondendo.
+     */
+    private static final String FORCED_PROMPT = """
+
+            La ricerca e' ristretta a: %s.
+            Passa questi filtri nelle chiamate a search_knowledge_base: sono gia' imposti
+            dall'applicazione, quindi ometterli allargherebbe i risultati.
+            """;
+
     private final ChatClient chatClient;
 
     public AgentService(ChatClient.Builder builder, RagTool ragTool) {
         this.chatClient = builder.defaultTools(ragTool).build();
     }
 
-    /** Una domanda all'agente: toolCalls elenca le ricerche fatte, in ordine. */
-    public AgentResult ask(String question) {
-        // lista creata qui e passata nel toolContext: il tool la riempie durante il ciclo, e la
-        // stessa lista letta dopo dice quali ricerche ha deciso di fare il modello
+    /**
+     * Una domanda all'agente: toolCalls elenca le ricerche fatte, in ordine.
+     * <p>
+     * {@code forced} sono i filtri della richiesta HTTP: finiscono nel toolContext, quindi il tool
+     * li applica senza poter essere scavalcato dal modello, e finiscono anche nel prompt. Un
+     * valore vuoto non e' un filtro (vedi {@link SearchFilters}), quindi non serve validare nulla.
+     */
+    public AgentResult ask(String question, SearchFilters forced) {
+        // lista e filtri creati qui e passati nel toolContext: il toolContext e' per richiesta,
+        // quindi il bean resta senza stato e due richieste in parallelo non si mescolano
+        SearchFilters forcedFilters = forced == null ? emptyFilters() : forced;
         List<RagTool.SearchTrace> traces = new ArrayList<>();
+        Map<String, Object> toolContext = new HashMap<>();
+        toolContext.put(RagTool.TRACE_KEY, traces);
+        toolContext.put(RagTool.FORCED_KEY, forcedFilters);
+
         ChatResponse response = chatClient.prompt()
-                .system(SYSTEM_PROMPT)
+                .system(systemPrompt(forcedFilters))
                 .user(question)
-                .toolContext(Map.of(RagTool.TRACE_KEY, traces))
+                .toolContext(toolContext)
                 .call()
                 .chatResponse();
         String answer = response.getResult().getOutput().getText();
-        log.info("agente: {} ricerche su '{}' -> {}", traces.size(), question, traces);
+        log.info("agente: '{}', {} ricerche, forzati={} -> {}", question, traces.size(),
+                RagTool.filtersSummary(forcedFilters), traces);
         return new AgentResult(answer, List.copyOf(traces));
+    }
+
+    /** Il prompt di base, piu' i filtri imposti dalla richiesta se ce ne sono. */
+    static String systemPrompt(SearchFilters forced) {
+        String filters = RagTool.filtersSummary(forced);
+        return "-".equals(filters) ? SYSTEM_PROMPT : SYSTEM_PROMPT + String.format(FORCED_PROMPT, filters);
+    }
+
+    private static SearchFilters emptyFilters() {
+        return new SearchFilters(null, null, null, null, null);
     }
 
     /** answer = risposta finale dell'agente; toolCalls = le ricerche RAG che ha deciso di fare. */

@@ -136,4 +136,44 @@ class RagToolTest {
         assertThat(result).isEqualTo("Nessun chunk trovato.");
         verifyNoInteractions(searchService);
     }
+
+    @Test
+    void iFiltriDellaRichiestaHttpHannoPrecedenzaSuQuelliDelModello() {
+        // chi scrive la richiesta sa quali documenti esistono, il modello no: il suo langId=it
+        // non puo' allargare una richiesta che chiede esplicitamente langId=en
+        SearchService searchService = mock(SearchService.class);
+        when(searchService.chunksAboveThreshold(anyString(), any(), any())).thenReturn(List.of());
+        List<RagTool.SearchTrace> traces = new ArrayList<>();
+        ToolContext toolContext = new ToolContext(Map.of(
+                RagTool.TRACE_KEY, traces,
+                RagTool.FORCED_KEY, new SearchFilters(null, "en", "C-101", null, null)));
+
+        new RagTool(searchService, "vuoto")
+                .search("errore E4521", "semantic", null, "it", null, List.of("errori"), null, toolContext);
+
+        // langId e contentId sono imposti dalla richiesta e restano quelli; topics la richiesta
+        // non li toccava, quindi valgono quelli scelti dal modello (precedenza campo per campo)
+        assertThat(traces.get(0).filters()).isEqualTo("langId=en, contentId=C-101, topics=[errori]");
+    }
+
+    @Test
+    void senzaFiltriDallaRichiestaRestanoQuelliDelModello() {
+        SearchService searchService = mock(SearchService.class);
+        when(searchService.chunksAboveThreshold(anyString(), any(), any())).thenReturn(List.of());
+        List<RagTool.SearchTrace> traces = new ArrayList<>();
+
+        new RagTool(searchService, "vuoto").search("errore", null, null, "it", null, null, null,
+                new ToolContext(Map.of(RagTool.TRACE_KEY, traces)));
+
+        assertThat(traces.get(0).filters()).isEqualTo("langId=it");
+    }
+
+    @Test
+    void iFiltriForzatiFinisconoNelPromptCosiIlModelloNonLiDimentica() {
+        String senzaFiltri = AgentService.systemPrompt(new SearchFilters(null, null, null, null, null));
+        String conFiltri = AgentService.systemPrompt(new SearchFilters(null, "en", "C-101", null, null));
+
+        assertThat(senzaFiltri).doesNotContain("ristretta");
+        assertThat(conFiltri).contains("ristretta a: langId=en, contentId=C-101");
+    }
 }

@@ -43,11 +43,20 @@ public class ApiController {
     /**
      * Agente: il RAG come tool. Il modello decide quando cercare e con quali filtri, e risponde
      * usando i chunk che il tool restituisce; toolCalls elenca le ricerche fatte.
-     * /agent/chat?q=cosa significa l'errore E4521?
+     * <p>
+     * I filtri qui sono gli stessi opzionali di /search, con la differenza che hanno la
+     * precedenza su quelli che il modello sceglie da solo (campo per campo): servono quando chi
+     * chiama sa gia' quale documento o quale lingua vuole, e vuole che l'agente non se ne discosti.
+     * /agent/chat?q=...?langId=en&amp;contentId=C-101
      */
     @GetMapping("/agent/chat")
-    public AgentResult agentChat(@RequestParam String q) {
-        return agentService.ask(q);
+    public AgentResult agentChat(@RequestParam String q,
+                                 @RequestParam(required = false) String source,
+                                 @RequestParam(required = false) String langId,
+                                 @RequestParam(required = false) String contentId,
+                                 @RequestParam(name = "topic", required = false) List<String> topics,
+                                 @RequestParam(required = false) String filename) {
+        return agentService.ask(q, new SearchFilters(source, langId, contentId, topics, filename));
     }
 
     /**

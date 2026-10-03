@@ -4,7 +4,8 @@ Spring Boot 3.5.6 + Spring AI 1.0.7: RAG su Elasticsearch — ingest con chunkin
 `/search` che recupera i chunk per similarità e risponde usando solo quelli. Chat ed embedding
 passano entrambi da client OpenAI con `base-url` separati (Groq per la chat, Jina per gli
 embedding). `/agent/chat` espone lo stesso RAG come **tool** e lascia che sia il modello a
-decidere quando e come cercare.
+decidere quando e come cercare; i filtri che arrivano con la richiesta HTTP hanno la precedenza su
+quelli che sceglie il modello.
 
 ```
 pom.xml
@@ -25,6 +26,7 @@ src/main/resources/application.yml
 scripts/curl-examples.sh          demo completa: ingest, search, index, knn, chat
 scripts/curl-grouped.sh           /search/grouped: confronto fra documenti
 scripts/curl-agent.sh             /agent/chat: l'agente che decide cosa cercare
+scripts/curl-agent-filters.sh     /agent/chat: i filtri dalla richiesta, con i controlli che dicono se passano
 scripts/search.sh                 singola chiamata /search con request, response e timing
 ```
 
@@ -372,7 +374,7 @@ soglia) ma **senza la chiamata all'LLM**.
 |---|---|
 | `question` (obbligatorio) | cosa cercare |
 | `mode` | `semantic` (default), `hybrid`, `lexical` |
-| `source`, `langId`, `contentId`, `topics`, `filename` | gli stessi filtri di `/search`, ma **li sceglie il modello** |
+| `source`, `langId`, `contentId`, `topics`, `filename` | gli stessi filtri di `/search`, ma **li sceglie il modello**, a meno che la richiesta HTTP non li imponga ([filtri dalla richiesta](#filtri-dalla-richiesta)) |
 
 Il ritorno è **testo**, non una risposta:
 
@@ -434,11 +436,70 @@ Brasile"**, perché non ha un indice da cui prendere. Con il RAG come tool l'age
 lo dice. Che abbia provato una o due query diverse prima di arrendersi è il comportamento utile (una
 ricerca mancata non è una risposta falsa), ma è anche il caso in cui il costo raddoppia.
 
+### Filtri dalla richiesta
+
+I filtri sono **opzionali anche su `/agent/chat`**, e sono gli stessi di `/search`. Cambia solo chi
+ha l'ultima parola:
+
+```bash
+# il modello sceglie tutto, come prima
+curl -G localhost:8080/agent/chat --data-urlencode "q=cosa dice sull'errore E4521?"
+
+# la richiesta impone lingua e documento, il modello non può scelgerli
+curl -G localhost:8080/agent/chat --data-urlencode "q=cosa dice sull'errore E4521?" -d langId=en -d contentId=C-101
+```
+
+```json
+{
+  "answer": "Il codice di errore **E4521** indica che il filtro della lavatrice è intasato; è necessario sciacquarlo sotto acqua corrente [manuale-en#0].",
+  "toolCalls": [
+    {"question": "E4521", "mode": "semantic", "filters": "langId=en, contentId=C-101", "chunks": 1}
+  ]
+}
+```
+
+**Un filtro vale solo se c'è**: la precedenza è **campo per campo**, quindi un campo che la richiesta
+non tocca resta quello che scelge il modello. `?langId=en` non cancella un `topics` che il modello ha
+deciso, e `?contentId=C-101` non impedisce al modello di scegliere `mode=lexical`.
+
+Le regole, in una riga ciascuna:
+
+| | |
+|---|---|
+| **chi vince** | la richiesta HTTP, su ogni campo valorizzato |
+| **come si applica** | `SearchFilters.merge`, nel tool, campo per campo: i vuoti sono "non filtrato" |
+| **come si fa sapere al modello** | i filtri finiscono anche nel system prompt ("La ricerca è ristretta a: langId=en, contentId=C-101") |
+| **`topics`** | vince la lista intera, non l'unione con quella del modello: dentro il campo è una OR, quindi unire cambierebbe il filtro |
+| **dove si vede** | in `toolCalls`, `filters` mostra i filtri **effettivi** del tool, non quelli richiesti |
+
+I filtri viaggiano nel `toolContext`, che è **per richiesta**: `AgentService` mette lì anche la lista
+delle trace, quindi il bean `RagTool` resta senza stato e due richieste in parallelo non si
+mescolano. Il prompt li dichiara perché il modello li passi nelle sue chiamate (risparmia un giro) e
+soprattutto perché non racconti di aver cercato in una lingua diversa da quella su cui risponde.
+
+Le trace mostrano che la precedenza è reale, non un consiglio:
+
+```
+$ curl -G localhost:8080/agent/chat --data-urlencode "q=cosa dice il manuale italiano sull'errore E4521?" -d langId=en
+   chiede "manuale italiano", la richiesta impone langId=en
+   → toolCalls: [{question: E4521, filters: langId=en, chunks: 1}, {question: E4521, filters: langId=en, chunks: 1}]
+```
+
+E il caso inverso, che è la prova del campo per campo — `source` imposti, `langId` libero, e
+l'agente che aggiunge il suo `langId=en` accanto a un filtro che non aveva ricevuto:
+
+```
+$ curl -G localhost:8080/agent/chat --data-urlencode "q=cosa dice sull'errore E4521?" -d source=manuale-en
+   → toolCalls: [{question: E4521, mode: lexical, filters: source=manuale-en, langId=en, chunks: 1}]
+```
+
+`./scripts/curl-agent-filters.sh` esegue tutti i casi e verifica i `toolCalls` uno per uno.
+
 ### Dove si vede
 
 - `toolCalls` nella risposta: le ricerche in ordine, con `mode`, filtri e quanti chunk ha trovato
   ciascuna (`chunks: 0` = soglia respinta).
-- log `AgentService`: `agente: 2 ricerche su '...' -> [SearchTrace[question=..., mode=..., filters=..., chunks=2]]`
+- log `AgentService`: `agente: 'E4521', 1 ricerche, forzati=langId=en -> [SearchTrace[question=E4521, mode=lexical, filters=langId=en, chunks=1]]`
 - log `http.request`: il JSON con `tools` e i `tool_calls` che il provider ha risposto
 
 ### Limiti
@@ -454,11 +515,20 @@ ricerca mancata non è una risposta falsa), ma è anche il caso in cui il costo 
   l'agente conclude che non c'è niente. È un rischio che `/search` non ha: lì i filtri li scrive
   chi conosce i dati, qui li scrive il modello. Se i metadati sono molti e sensibili, meglio o
   restringere i valori offerti al tool o toglierli e lasciare solo `mode`.
+- **Un filtro imposto non cambia la domanda.** Con `?langId=en` su "cosa dice il manuale
+  **italiano**...", l'agente cerca solo in inglese: misurato, risponde che nel manuale italiano non
+  c'è niente su E4521. Il filtro garantisce **i dati**, non la coerenza con la domanda — se la
+  domanda e i filtri si contraddicono, è la domanda che va corretta, o i filtri tolti.
 - **Gli argomenti inventati degradano invece di fallire.** Un `mode` inesistente non è un 400 come
   su `/search`: `RagTool.modeOrDefault` ricade su `semantic` e la richiesta va avanti. Vale per una
   `question` vuota (non si chiama l'embedding, si risponde come "non trovato") e per un
   `topics: [""]`, che viene rimosso: una `terms` query con `""` non matcherebbe nessun chunk e
   l'agente leggerebbe "non trovato" dove in realtà non aveva filtrato.
+- **Un 429 del provider diventa un 500.** Le chiamate dell'agente sono N+1, quindi una sequenza di
+  richieste esaurisce il token-per-minute del provider (Groq: 8000) e la risposta è un 500 con
+  stack trace, non un 429 con un messaggio utile. Vale anche per `/chat`. Nell'agente è più facile
+  da incontrare perché una domanda sola può costare tre completions: in `curl-agent-filters.sh` la
+  pausa fra i casi (`PAUSE_SECONDS`) serve per questo.
 
 ### Configurazione
 
@@ -472,9 +542,18 @@ Il resto è già in `app.search.*`: il tool usa le stesse impostazioni di `/sear
 `num-candidates`, `min-score`, `rrf-k`, ...), quindi **nessuna soglia nuova da tarare**.
 
 ```bash
-./scripts/curl-agent.sh   # una domanda, un confronto fra documenti, una fuori indice, e /chat come confronto
-                          # stampa richiesta e risposta di ogni caso, come scripts/search.sh
+./scripts/curl-agent.sh         # una domanda, un confronto fra documenti, filtri imposti dalla richiesta,
+                                # una domanda fuori indice, e /chat come confronto
+                                # stampa richiesta e risposta di ogni caso, come scripts/search.sh
+./scripts/curl-agent-filters.sh # solo i filtri dalla richiesta, e per ogni caso un verdetto:
+                                # ogni ricerca del modello deve essere finita con quei filtri
 ```
+
+`curl-agent-filters.sh` esce con 1 se un controllo fallisce, quindi serve anche come test. I
+controlli sono sui `toolCalls`, non sulla risposta: "ha risposto bene" non dice nulla sui filtri,
+"ogni ricerca è finita con `langId=en`" sì. `PAUSE_SECONDS` (default 6) è la pausa fra i casi:
+l'agente costa N+1 chiamate al modello, e sette casi di fila senza pausa esauriscono il
+token-per-minute del provider (Groq: 429, che l'app restituisce come 500).
 
 ## Il fallback `no-answer`
 

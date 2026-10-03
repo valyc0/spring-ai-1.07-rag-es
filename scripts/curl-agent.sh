@@ -16,15 +16,17 @@ h() { printf '\n\033[1m# %s\033[0m\n' "$*"; }
 
 # Una chiamata con richiesta e risposta. La richiesta e' la riga curl, non un body:
 # /agent/chat e' una GET con la domanda in un query param, quindi la riga dice tutto
-# quello che va detto. La risposta si formatta come in search.sh, e in un agente la
-# risposta da sola non basta: quello che conta e' anche toolCalls, cioe' quali ricerche
-# ha deciso di fare il modello.
+# quello che va detto. Gli argomenti in piu' sono i filtri opzionali (-d langId=en).
+# La risposta si formatta come in search.sh, e in un agente la risposta da sola non
+# basta: quello che conta e' anche toolCalls, cioe' quali ricerche ha deciso di fare
+# il modello e con quali filtri sono finite.
 ask() {
 	local endpoint="$1" query="$2"
-	printf '\n\033[2mcurl -G "%s%s" --data-urlencode "q=%s"\033[0m\n' "$BASE_URL" "$endpoint" "$query"
+	shift 2
+	printf '\n\033[2mcurl -G "%s%s" --data-urlencode "q=%s" %s\033[0m\n' "$BASE_URL" "$endpoint" "$query" "$*"
 	local body
 	body=$(mktemp)
-	if ! curl -sS -G "$BASE_URL$endpoint" --data-urlencode "q=$query" -o "$body"; then
+	if ! curl -sS -G "$BASE_URL$endpoint" --data-urlencode "q=$query" "$@" -o "$body"; then
 		printf '\033[31mchiamata fallita\033[0m\n'
 		rm -f "$body"
 		return 1
@@ -48,6 +50,12 @@ ask /agent/chat "confronta cosa dice il manuale italiano e quello inglese sull'e
 
 h "codice esatto: il modello sceglie mode=lexical da solo"
 ask /agent/chat "E4521"
+
+h "filtri dalla richiesta: contentId noto, una sola ricerca e un solo chunk"
+ask /agent/chat "cosa dice sull'errore E4521?" -d contentId=C-101 -d langId=en
+
+h "filtri dalla richiesta che contraddicono la domanda: la richiesta vince, e si vede"
+ask /agent/chat "cosa dice il manuale italiano sull'errore E4521?" -d langId=en
 
 h "domanda fuori indice: il tool non trova chunk, l'agente lo dice e non inventa"
 ask /agent/chat "Chi ha vinto il campionato di calcio del 1994?"
