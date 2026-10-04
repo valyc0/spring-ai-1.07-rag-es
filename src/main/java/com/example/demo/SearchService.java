@@ -10,7 +10,11 @@ import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
 import org.springframework.data.elasticsearch.core.SearchHit;
 import org.springframework.stereotype.Service;
 
+import co.elastic.clients.elasticsearch._types.SortOrder;
+import co.elastic.clients.elasticsearch._types.aggregations.Aggregation;
+import co.elastic.clients.elasticsearch._types.aggregations.StringTermsBucket;
 import co.elastic.clients.elasticsearch._types.query_dsl.Query;
+import org.springframework.data.elasticsearch.client.elc.ElasticsearchAggregations;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -81,30 +85,10 @@ public class SearchService {
     }
 
     public SearchResult search(String question, SearchMode mode, SearchFilters filters) {
-        List<Query> filterQueries = filters.toQueries();
-
-        // 1. embed della domanda (stesso modello usato in ingest, altrimenti i vettori non confrontabili)
-        float[] queryVector = embeddingModel.embed(question);
-
-        // 2. kNN filtrato. In HYBRID chiede rank-window vicini invece di top-k: RRF lavora
-        //    sui ranking, e un chunk al 10o posto in kNN ma 1o in BM25 deve poter risalire.
-        List<SearchHit<ChunkDocument>> knnHits =
-                knn(queryVector, filterQueries, mode == SearchMode.HYBRID ? rankWindow : topK);
-
-        // 3. soglia di rilevanza, sempre sullo score kNN (0-1) anche in HYBRID: lo score RRF
-        //    dipende solo dalle posizioni, non dice se il primo chunk parla davvero della domanda.
-        //    Sotto soglia la risposta e' fissa e NON passa dal LLM: deterministica e senza costo.
-        //    Con filtri troppo stretti knnHits e' vuoto e si finisce qui.
-        if (knnHits.isEmpty() || knnHits.get(0).getScore() < minScore) {
-            float top = knnHits.isEmpty() ? 0f : knnHits.get(0).getScore();
-            log.info("nessun chunk sopra la soglia: mode={} top={} minScore={} filters={} -> {}",
-                    mode, top, minScore, filters, question);
+        List<ChunkHit> ranked = retrieve(question, mode, filters);
+        if (ranked.isEmpty()) {
             return new SearchResult(noAnswer, mode, List.of(), 0);
         }
-
-        List<ChunkHit> ranked = mode == SearchMode.HYBRID
-                ? fuse(knnHits, bm25(question, filterQueries))
-                : knnHits.stream().map(h -> ChunkHit.of(h.getContent(), h.getScore(), h.getScore(), null)).toList();
 
         // 4. contesto per il LLM
         StringBuilder context = new StringBuilder();
@@ -128,6 +112,81 @@ public class SearchService {
                 .content();
 
         return new SearchResult(answer, mode, ranked, ranked.size());
+    }
+
+    /**
+     * Solo retrieval: embed -> kNN [+ BM25] filtrati -> soglia. Lista vuota se nessun chunk
+     * supera la soglia. Usato da {@link #search} e dal tool dell'agente.
+     */
+    public List<ChunkHit> retrieve(String question, SearchMode mode, SearchFilters filters) {
+        List<Query> filterQueries = filters.toQueries();
+
+        // 1. embed della domanda (stesso modello usato in ingest, altrimenti i vettori non confrontabili)
+        float[] queryVector = embeddingModel.embed(question);
+
+        // 2. kNN filtrato. In HYBRID chiede rank-window vicini invece di top-k: RRF lavora
+        //    sui ranking, e un chunk al 10o posto in kNN ma 1o in BM25 deve poter risalire.
+        List<SearchHit<ChunkDocument>> knnHits =
+                knn(queryVector, filterQueries, mode == SearchMode.HYBRID ? rankWindow : topK);
+
+        // 3. soglia di rilevanza, sempre sullo score kNN (0-1) anche in HYBRID: lo score RRF
+        //    dipende solo dalle posizioni, non dice se il primo chunk parla davvero della domanda.
+        //    Sotto soglia la risposta e' fissa e NON passa dal LLM: deterministica e senza costo.
+        //    Con filtri troppo stretti knnHits e' vuoto e si finisce qui.
+        if (knnHits.isEmpty() || knnHits.get(0).getScore() < minScore) {
+            float top = knnHits.isEmpty() ? 0f : knnHits.get(0).getScore();
+            log.info("nessun chunk sopra la soglia: mode={} top={} minScore={} filters={} -> {}",
+                    mode, top, minScore, filters, question);
+            return List.of();
+        }
+
+        return mode == SearchMode.HYBRID
+                ? fuse(knnHits, bm25(question, filterQueries))
+                : knnHits.stream().map(h -> ChunkHit.of(h.getContent(), h.getScore(), h.getScore(), null)).toList();
+    }
+
+    /**
+     * Lettura per identita', non per similarita': i primi {@code limit} chunk che passano i filtri,
+     * in ordine di chunkIndex. Niente kNN e niente soglia. Serve a "di cosa parla il documento X".
+     */
+    public List<ChunkHit> fetchChunks(SearchFilters filters, int limit) {
+        NativeQuery query = NativeQuery.builder()
+                .withQuery(Query.of(q -> q.bool(b -> b.filter(filters.toQueries()))))
+                .withSort(s -> s.field(f -> f.field("chunkIndex").order(SortOrder.Asc)))
+                .withMaxResults(limit)
+                .build();
+        return operations.search(query, ChunkDocument.class).getSearchHits().stream()
+                .map(h -> ChunkHit.of(h.getContent(), 0f, null, null))
+                .toList();
+    }
+
+    /** Un documento (source) presente in indice, con i metadati del primo bucket trovato. */
+    public record DocumentInfo(String source, String contentId, String langId, long chunks) {}
+
+    /** Elenco dei documenti nel perimetro dei filtri: terms aggregation su source (max 100). */
+    public List<DocumentInfo> listDocuments(SearchFilters filters) {
+        Aggregation byDoc = Aggregation.of(a -> a
+                .terms(t -> t.field("source").size(100))
+                .aggregations("contentId", sub -> sub.terms(t -> t.field("contentId").size(1)))
+                .aggregations("langId", sub -> sub.terms(t -> t.field("langId").size(1))));
+        NativeQuery query = NativeQuery.builder()
+                .withQuery(Query.of(q -> q.bool(b -> b.filter(filters.toQueries()))))
+                .withAggregation("docs", byDoc)
+                .withMaxResults(0)
+                .build();
+        ElasticsearchAggregations aggs = (ElasticsearchAggregations) operations.search(query, ChunkDocument.class)
+                .getAggregations();
+        List<DocumentInfo> docs = new ArrayList<>();
+        for (StringTermsBucket b : aggs.get("docs").aggregation().getAggregate().sterms().buckets().array()) {
+            docs.add(new DocumentInfo(b.key().stringValue(), firstKey(b, "contentId"), firstKey(b, "langId"),
+                    b.docCount()));
+        }
+        return docs;
+    }
+
+    private static String firstKey(StringTermsBucket bucket, String sub) {
+        var buckets = bucket.aggregations().get(sub).sterms().buckets().array();
+        return buckets.isEmpty() ? null : buckets.get(0).key().stringValue();
     }
 
     // Solo knn, senza query: con una query (es. match_all) ES SOMMA i due score e la soglia

@@ -17,7 +17,8 @@ src/main/java/com/example/demo
 ├── SearchMode.java               SEMANTIC (kNN) | HYBRID (kNN + BM25, RRF)
 ├── SearchService.java            embed(query) -> kNN [+ BM25] filtrati -> soglia -> contesto -> LLM
 ├── HttpLoggingConfig.java        logga la request HTTP di chat/embedding
-└── ApiController.java            GET /chat, GET /search, POST /ingest
+├── AgentSearchService.java       ricerca agentica: il LLM chiama il tool searchKnowledgeBase
+└── ApiController.java            GET /chat, GET /search, GET /agent/search, POST /ingest
 src/main/resources/application.yml
 scripts/curl-examples.sh          demo completa: ingest, search, index, knn, chat
 scripts/search.sh                 singola chiamata /search con request, response e timing
@@ -123,6 +124,22 @@ class IngestApiTest {
 una sola `embeddingModel.embed(chunks)` (tutti i chunk in una request) →
 `operations.save(docs)` su Elasticsearch. La request HTTP verso Jina che ne esce è quella loggata
 in nota 9.
+
+## `/agent/search`: ricerca agentica
+
+`GET /agent/search?q=...` dà al LLM un tool Spring AI (`@Tool searchKnowledgeBase`, che riusa
+`SearchService.retrieve()`: stessi filtri, soglia e modalità semantic/hybrid di `/search`). Il LLM decide
+quante ricerche fare e con quale query: riformula se non trova, scompone domande multiple. Il loop
+tool-call lo esegue Spring AI dentro `call()`. La risposta ha `answer`, `steps` (le chiamate al tool
+con query/mode/filtri/hits) e `sources`. Senza nessun chunk trovato risponde `no-answer`, senza LLM.
+`langId` e `contentId` opzionali vincolano tutte le ricerche dell'agente a quel contenuto: sono
+applicati dal codice a ogni chiamata del tool, il LLM non può ignorarli. Per domande su *di cosa parla un documento* (che la ricerca per similarità scarterebbe sotto soglia) ci sono
+`listDocuments` (aggregazione su `source`) e `getDocumentChunks` (primi N chunk in ordine, senza kNN né soglia).
+Il limite di 4 ricerche è solo nel prompt (Spring AI 1.0 non ha un tetto alle iterazioni).
+
+```bash
+curl -G localhost:8080/agent/search --data-urlencode "q=Di che colore sono le palline da tennis?"
+```
 
 ## `/search`: il RAG completo
 

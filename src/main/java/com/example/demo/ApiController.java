@@ -21,11 +21,14 @@ public class ApiController {
     private final ChatClient chatClient;
     private final IngestService ingestService;
     private final SearchService searchService;
+    private final AgentSearchService agentSearchService;
 
-    public ApiController(ChatClient.Builder builder, IngestService ingestService, SearchService searchService) {
+    public ApiController(ChatClient.Builder builder, IngestService ingestService, SearchService searchService,
+                         AgentSearchService agentSearchService) {
         this.chatClient = builder.build();
         this.ingestService = ingestService;
         this.searchService = searchService;
+        this.agentSearchService = agentSearchService;
     }
 
     @GetMapping("/chat")
@@ -53,6 +56,18 @@ public class ApiController {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "mode deve essere semantic o hybrid");
         }
         return searchService.search(q, searchMode, new SearchFilters(source, langId, contentId, topics, filename));
+    }
+
+    /**
+     * Ricerca agentica: il LLM decide quante ricerche fare (tool) e con quali parametri.
+     * langId e contentId (opzionali) limitano TUTTE le ricerche dell'agente a quel contenuto.
+     * La risposta include i passi eseguiti ("steps") oltre alle fonti.
+     */
+    @GetMapping("/agent/search")
+    public AgentSearchService.AgentResult agentSearch(@RequestParam String q,
+                                                      @RequestParam(required = false) String langId,
+                                                      @RequestParam(required = false) String contentId) {
+        return agentSearchService.search(q, langId, contentId);
     }
 
     /** Ingest con metadati: body JSON {source, text, langId, contentId, topics[], filename}. */
