@@ -32,30 +32,35 @@ public class AgentSearchService {
               Un riassunto basato sui primi chunk copre solo l'inizio del documento: dichiaralo.
             - Per domande su fatti specifici usa searchKnowledgeBase. Cerca prima di rispondere. Se la domanda ha piu' parti, fai una ricerca per parte.
             - Se una ricerca non trova nulla o poco, riformula (sinonimi, termini piu' specifici) e riprova,
-              al massimo 4 ricerche in totale.
+              al massimo %d chiamate ai tool in totale.
             - mode=hybrid per codici, nomi propri, sigle; mode=semantic per domande in linguaggio naturale.
             - NON usare filtri (topics, source) a meno che l'utente li chieda esplicitamente: i documenti
               possono non avere quei metadati e un filtro inventato azzera i risultati.
             - Non usare conoscenze esterne e non inventare: se dopo le ricerche mancano informazioni, dillo.
+            - Se un tool risponde 'limite raggiunto' o 'gia' eseguita', smetti di chiamare tool e rispondi
+              con quello che hai (o di' che le informazioni mancano).
             - Cita la fonte (tra parentesi quadre) per ogni informazione.
             """;
 
     private final ChatClient chatClient;
     private final SearchService searchService;
     private final String noAnswer;
+    private final int maxToolCalls;
 
     public AgentSearchService(ChatClient.Builder builder, SearchService searchService,
-                              @Value("${app.search.no-answer:Non ho informazioni a riguardo.}") String noAnswer) {
+                              @Value("${app.search.no-answer:Non ho informazioni a riguardo.}") String noAnswer,
+                              @Value("${app.agent.max-tool-calls:6}") int maxToolCalls) {
         this.chatClient = builder.build();
         this.searchService = searchService;
         this.noAnswer = noAnswer;
+        this.maxToolCalls = maxToolCalls;
     }
 
     public AgentResult search(String question, String langId, String contentId) {
         // un tool nuovo per richiesta: raccoglie passi e fonti di QUESTA richiesta senza stato condiviso
-        KnowledgeTools tools = new KnowledgeTools(searchService, blankToNull(langId), blankToNull(contentId));
+        KnowledgeTools tools = new KnowledgeTools(searchService, blankToNull(langId), blankToNull(contentId), maxToolCalls);
         String answer = chatClient.prompt()
-                .system(SYSTEM_PROMPT)
+                .system(SYSTEM_PROMPT.formatted(maxToolCalls))
                 .user(question)
                 .tools(tools)
                 .call()
@@ -63,7 +68,7 @@ public class AgentSearchService {
         if (tools.sources.isEmpty()) {
             answer = noAnswer;
         }
-        return new AgentResult(answer, tools.steps, new ArrayList<>(tools.sources.values()));
+        return new AgentResult(answer, tools.steps, new ArrayList<>(tools.sources.values()), tools.truncated);
     }
 
     /** Il tool esposto al LLM. I metodi @Tool sono invocati da Spring AI sul thread della richiesta. */
@@ -73,13 +78,40 @@ public class AgentSearchService {
         // vincoli decisi dal chiamante: applicati a ogni ricerca, il LLM non li vede ne' li puo' cambiare
         private final String langId;
         private final String contentId;
+        private final int maxToolCalls;
+        private final java.util.Set<String> seen = new java.util.HashSet<>();
+        private int calls;
+        boolean truncated;
         final List<ToolStep> steps = new ArrayList<>();
         final Map<String, ChunkHit> sources = new LinkedHashMap<>();
 
-        KnowledgeTools(SearchService searchService, String langId, String contentId) {
+        KnowledgeTools(SearchService searchService, String langId, String contentId, int maxToolCalls) {
+            this.maxToolCalls = maxToolCalls;
             this.searchService = searchService;
             this.langId = langId;
             this.contentId = contentId;
+        }
+
+        /**
+         * Guardia anti-loop. Spring AI 1.0.7 non limita le iterazioni e un'eccezione dal tool non
+         * ferma il ciclo (verrebbe rimandata al LLM come testo): per questo il tetto e' un messaggio.
+         * Restituisce il messaggio da dare al LLM se la chiamata va bloccata, null se puo' procedere.
+         */
+        private String guard(String tool, String arg, String argsKey) {
+            if (++calls > maxToolCalls) {
+                return blocked(tool, arg, "Limite di chiamate raggiunto: non cercare altro, rispondi ora con le "
+                        + "informazioni gia' ottenute oppure di' che mancano.");
+            }
+            if (!seen.add(tool + "|" + argsKey.toLowerCase().strip())) {
+                return blocked(tool, arg, "Ricerca gia' eseguita con questi parametri: cambia query o rispondi.");
+            }
+            return null;
+        }
+
+        private String blocked(String tool, String arg, String message) {
+            truncated = true;
+            steps.add(new ToolStep(tool, arg, "-", new SearchFilters(null, langId, contentId, null, null), -1));
+            return message;
         }
 
         @Tool(description = """
@@ -90,6 +122,10 @@ public class AgentSearchService {
                 @ToolParam(description = "semantic (significato) oppure hybrid (significato + parole esatte)", required = false) String mode,
                 @ToolParam(description = "Lascia VUOTO salvo richiesta esplicita dell'utente. Filtra per topic (basta uno dei valori)", required = false) List<String> topics,
                 @ToolParam(description = "Lascia VUOTO salvo richiesta esplicita dell'utente. Filtra per source esatta", required = false) String source) {
+            String blocked = guard("searchKnowledgeBase", query, query + "|" + mode + "|" + topics + "|" + source);
+            if (blocked != null) {
+                return blocked;
+            }
             SearchMode searchMode = "hybrid".equalsIgnoreCase(mode) ? SearchMode.HYBRID : SearchMode.SEMANTIC;
             SearchFilters filters = new SearchFilters(blankToNull(source), langId, contentId, topics, null);
 
@@ -111,6 +147,10 @@ public class AgentSearchService {
                 Elenca i documenti disponibili (source, contentId, langId, numero di chunk).
                 Usalo per trovare il nome esatto di un documento prima di leggerlo.""")
         String listDocuments() {
+            String blocked = guard("listDocuments", "-", "-");
+            if (blocked != null) {
+                return blocked;
+            }
             SearchFilters filters = new SearchFilters(null, langId, contentId, null, null);
             List<DocumentInfo> docs = searchService.listDocuments(filters);
             steps.add(new ToolStep("listDocuments", "-", "-", filters, docs.size()));
@@ -131,6 +171,10 @@ public class AgentSearchService {
         String getDocumentChunks(
                 @ToolParam(description = "Nome esatto della source (vedi listDocuments)") String source,
                 @ToolParam(description = "Quanti chunk leggere, default 8, massimo 15", required = false) Integer maxChunks) {
+            String blocked = guard("getDocumentChunks", source, source + "|" + maxChunks);
+            if (blocked != null) {
+                return blocked;
+            }
             int limit = Math.max(1, Math.min(maxChunks == null ? 8 : maxChunks, 15));
             SearchFilters filters = new SearchFilters(blankToNull(source), langId, contentId, null, null);
             List<ChunkHit> hits = searchService.fetchChunks(filters, limit);
@@ -155,5 +199,6 @@ public class AgentSearchService {
     /** Una chiamata del LLM a un tool: quale, con che argomento e quanti risultati ha ottenuto. */
     public record ToolStep(String tool, String query, String mode, SearchFilters filters, int hits) {}
 
-    public record AgentResult(String answer, List<ToolStep> steps, List<ChunkHit> sources) {}
+    /** truncated = true se la guardia anti-loop ha bloccato almeno una chiamata (hits=-1 negli steps). */
+    public record AgentResult(String answer, List<ToolStep> steps, List<ChunkHit> sources, boolean truncated) {}
 }

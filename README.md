@@ -127,6 +127,8 @@ in nota 9.
 
 ## `/agent/search`: ricerca agentica
 
+Documentazione completa (ciclo dei tool, codice passo per passo, guardia anti-loop): [`docs/AGENT.md`](docs/AGENT.md).
+
 `GET /agent/search?q=...` dà al LLM un tool Spring AI (`@Tool searchKnowledgeBase`, che riusa
 `SearchService.retrieve()`: stessi filtri, soglia e modalità semantic/hybrid di `/search`). Il LLM decide
 quante ricerche fare e con quale query: riformula se non trova, scompone domande multiple. Il loop
@@ -135,7 +137,9 @@ con query/mode/filtri/hits) e `sources`. Senza nessun chunk trovato risponde `no
 `langId` e `contentId` opzionali vincolano tutte le ricerche dell'agente a quel contenuto: sono
 applicati dal codice a ogni chiamata del tool, il LLM non può ignorarli. Per domande su *di cosa parla un documento* (che la ricerca per similarità scarterebbe sotto soglia) ci sono
 `listDocuments` (aggregazione su `source`) e `getDocumentChunks` (primi N chunk in ordine, senza kNN né soglia).
-Il limite di 4 ricerche è solo nel prompt (Spring AI 1.0 non ha un tetto alle iterazioni).
+Anti-loop: Spring AI 1.0 non ha un tetto alle iterazioni e un'eccezione dal tool non ferma il ciclo, quindi
+una guardia nei tool blocca oltre `app.agent.max-tool-calls` (6) chiamate e le chiamate identiche ripetute,
+rispondendo al LLM di concludere; la risposta ha `truncated=true` e la chiamata bloccata compare negli `steps` con `hits=-1`.
 
 ```bash
 curl -G localhost:8080/agent/search --data-urlencode "q=Di che colore sono le palline da tennis?"
