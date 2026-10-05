@@ -7,12 +7,17 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Sinks;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 
 /**
  * Ricerca agentica: invece del flusso fisso di /search (un retrieval, una risposta) il LLM
@@ -56,9 +61,51 @@ public class AgentSearchService {
         this.maxToolCalls = maxToolCalls;
     }
 
+    private KnowledgeTools newTools(String langId, String contentId, Consumer<ToolStep> onStep) {
+        return new KnowledgeTools(searchService, blankToNull(langId), blankToNull(contentId), maxToolCalls, onStep);
+    }
+
+    /**
+     * Versione streaming (SSE). Eventi: {@code step} (ogni chiamata a un tool, appena avviene),
+     * {@code token} (pezzi di testo della risposta), {@code replace} (solo se nessun chunk e' stato
+     * recuperato: il testo gia' streamato va sostituito con no-answer), {@code done} (fonti e truncated),
+     * {@code error}. I token arrivano solo dopo l'ultimo tool: durante le ricerche il client vede gli step.
+     */
+    public Flux<ServerSentEvent<Object>> stream(String question, String langId, String contentId) {
+        Sinks.Many<ServerSentEvent<Object>> out = Sinks.many().unicast().onBackpressureBuffer();
+        Sinks.EmitFailureHandler retry = Sinks.EmitFailureHandler.busyLooping(Duration.ofSeconds(1));
+        // i tool girano su thread del LLM client, non serializzati: busyLooping gestisce l'emissione concorrente
+        KnowledgeTools tools = newTools(langId, contentId, step -> out.emitNext(event("step", step), retry));
+
+        chatClient.prompt()
+                .system(SYSTEM_PROMPT.formatted(maxToolCalls))
+                .user(question)
+                .tools(tools)
+                .stream()
+                .content()
+                .subscribe(
+                        token -> out.emitNext(event("token", token), retry),
+                        e -> {
+                            out.emitNext(event("error", String.valueOf(e.getMessage())), retry);
+                            out.emitComplete(retry);
+                        },
+                        () -> {
+                            if (tools.sources.isEmpty()) {
+                                out.emitNext(event("replace", noAnswer), retry);
+                            }
+                            out.emitNext(event("done", new Done(new ArrayList<>(tools.sources.values()), tools.truncated)), retry);
+                            out.emitComplete(retry);
+                        });
+        return out.asFlux();
+    }
+
+    private static ServerSentEvent<Object> event(String name, Object data) {
+        return ServerSentEvent.builder(data).event(name).build();
+    }
+
     public AgentResult search(String question, String langId, String contentId) {
         // un tool nuovo per richiesta: raccoglie passi e fonti di QUESTA richiesta senza stato condiviso
-        KnowledgeTools tools = new KnowledgeTools(searchService, blankToNull(langId), blankToNull(contentId), maxToolCalls);
+        KnowledgeTools tools = newTools(langId, contentId, step -> {});
         String answer = chatClient.prompt()
                 .system(SYSTEM_PROMPT.formatted(maxToolCalls))
                 .user(question)
@@ -79,17 +126,26 @@ public class AgentSearchService {
         private final String langId;
         private final String contentId;
         private final int maxToolCalls;
+        private final Consumer<ToolStep> onStep;
         private final java.util.Set<String> seen = new java.util.HashSet<>();
         private int calls;
         boolean truncated;
         final List<ToolStep> steps = new ArrayList<>();
         final Map<String, ChunkHit> sources = new LinkedHashMap<>();
 
-        KnowledgeTools(SearchService searchService, String langId, String contentId, int maxToolCalls) {
+        KnowledgeTools(SearchService searchService, String langId, String contentId, int maxToolCalls,
+                       Consumer<ToolStep> onStep) {
             this.maxToolCalls = maxToolCalls;
+            this.onStep = onStep;
             this.searchService = searchService;
             this.langId = langId;
             this.contentId = contentId;
+        }
+
+        /** Registra lo step e lo notifica a chi ascolta (lo streaming lo manda subito al client). */
+        private void record(ToolStep step) {
+            steps.add(step);
+            onStep.accept(step);
         }
 
         /**
@@ -110,7 +166,7 @@ public class AgentSearchService {
 
         private String blocked(String tool, String arg, String message) {
             truncated = true;
-            steps.add(new ToolStep(tool, arg, "-", new SearchFilters(null, langId, contentId, null, null), -1));
+            record(new ToolStep(tool, arg, "-", new SearchFilters(null, langId, contentId, null, null), -1));
             return message;
         }
 
@@ -130,7 +186,7 @@ public class AgentSearchService {
             SearchFilters filters = new SearchFilters(blankToNull(source), langId, contentId, topics, null);
 
             List<ChunkHit> hits = searchService.retrieve(query, searchMode, filters);
-            steps.add(new ToolStep("searchKnowledgeBase", query, searchMode.name(), filters, hits.size()));
+            record(new ToolStep("searchKnowledgeBase", query, searchMode.name(), filters, hits.size()));
             if (hits.isEmpty()) {
                 return "Nessun risultato pertinente.";
             }
@@ -153,7 +209,7 @@ public class AgentSearchService {
             }
             SearchFilters filters = new SearchFilters(null, langId, contentId, null, null);
             List<DocumentInfo> docs = searchService.listDocuments(filters);
-            steps.add(new ToolStep("listDocuments", "-", "-", filters, docs.size()));
+            record(new ToolStep("listDocuments", "-", "-", filters, docs.size()));
             if (docs.isEmpty()) {
                 return "Nessun documento disponibile.";
             }
@@ -178,7 +234,7 @@ public class AgentSearchService {
             int limit = Math.max(1, Math.min(maxChunks == null ? 8 : maxChunks, 15));
             SearchFilters filters = new SearchFilters(blankToNull(source), langId, contentId, null, null);
             List<ChunkHit> hits = searchService.fetchChunks(filters, limit);
-            steps.add(new ToolStep("getDocumentChunks", source, "-", filters, hits.size()));
+            record(new ToolStep("getDocumentChunks", source, "-", filters, hits.size()));
             if (hits.isEmpty()) {
                 return "Documento non trovato: controlla il nome con listDocuments.";
             }
@@ -201,4 +257,7 @@ public class AgentSearchService {
 
     /** truncated = true se la guardia anti-loop ha bloccato almeno una chiamata (hits=-1 negli steps). */
     public record AgentResult(String answer, List<ToolStep> steps, List<ChunkHit> sources, boolean truncated) {}
+
+    /** Evento finale dello streaming: fonti usate e se la guardia anti-loop e' scattata. */
+    public record Done(List<ChunkHit> sources, boolean truncated) {}
 }

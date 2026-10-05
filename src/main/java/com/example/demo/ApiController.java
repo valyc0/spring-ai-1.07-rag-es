@@ -5,12 +5,15 @@ import com.example.demo.SearchService.SearchResult;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
+
+import reactor.core.publisher.Flux;
 
 import java.util.List;
 import java.util.Map;
@@ -68,6 +71,14 @@ public class ApiController {
                                                       @RequestParam(required = false) String langId,
                                                       @RequestParam(required = false) String contentId) {
         return agentSearchService.search(q, langId, contentId);
+    }
+
+    /** Come /agent/search ma in streaming SSE: eventi step, token, replace, done, error. */
+    @GetMapping(path = "/agent/search/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<Object>> agentSearchStream(@RequestParam String q,
+                                                           @RequestParam(required = false) String langId,
+                                                           @RequestParam(required = false) String contentId) {
+        return agentSearchService.stream(q, langId, contentId);
     }
 
     /** Ingest con metadati: body JSON {source, text, langId, contentId, topics[], filename}. */

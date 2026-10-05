@@ -145,6 +145,15 @@ rispondendo al LLM di concludere; la risposta ha `truncated=true` e la chiamata 
 curl -G localhost:8080/agent/search --data-urlencode "q=Di che colore sono le palline da tennis?"
 ```
 
+**Streaming (SSE):** `GET /agent/search/stream` (stessi parametri) manda gli eventi `step` appena l'agente chiama
+un tool, poi i `token` della risposta, infine `done` (fonti, `truncated`). Se nessun chunk è stato recuperato arriva
+`replace` col testo `no-answer`: il client deve sostituire quanto già mostrato. In caso di errore, evento `error`.
+
+```bash
+curl -N -G localhost:8080/agent/search/stream --data-urlencode "q=Di che colore sono le palline da tennis?"
+./scripts/agent-stream.sh        # stampa ogni evento con il tempo di arrivo
+```
+
 ## `/search`: il RAG completo
 
 `GET /search?q=...` chiude il ciclo che `/ingest` aveva solo aperto. Tutto dentro l'app:

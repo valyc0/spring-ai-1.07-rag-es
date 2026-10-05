@@ -49,6 +49,25 @@ Risposta:
 - `sources`: i chunk effettivamente passati al LLM, senza duplicati.
 - `truncated`: `true` se la guardia anti-loop ha bloccato almeno una chiamata.
 
+### Variante in streaming: `GET /agent/search/stream`
+
+Stessi parametri, risposta `text/event-stream` (SSE). Il client vede l'agente lavorare in tempo reale:
+
+| Evento    | Dato | Quando |
+|-----------|------|--------|
+| `step`    | JSON `ToolStep` (come in `steps`) | subito, a ogni chiamata a un tool |
+| `token`   | pezzo di testo | durante la risposta finale |
+| `replace` | testo `no-answer` | solo se nessun chunk è stato recuperato: **il client deve sostituire** il testo già mostrato |
+| `done`    | JSON `{sources, truncated}` | fine normale |
+| `error`   | messaggio | errore (es. 429 del provider); dopo l'`error` lo stream si chiude |
+
+Come funziona (`AgentSearchService.stream()`): `chatClient...stream().content()` produce un `Flux<String>` di token; Spring AI
+esegue comunque il ciclo dei tool dentro lo stream. Gli `step` non vengono dal `Flux` dei token ma dal tool stesso: `KnowledgeTools`
+ha un listener (`onStep`) chiamato da `record(...)` a ogni chiamata, che scrive in un `Sinks.Many` da cui il controller legge.
+Token e step finiscono nello stesso sink, quindi nello stesso stream SSE e nell'ordine in cui accadono. I token arrivano solo dopo l'ultimo tool,
+perché il modello scrive la risposta quando ha finito di cercare. Il `no-answer` non si può decidere prima di sapere se i tool hanno trovato chunk, e a quel punto il testo è già partito: da qui `replace`.
+Provarlo: `./scripts/agent-stream.sh`.
+
 ## 2. Il ciclo dei tool (cosa fa Spring AI)
 
 Il codice dell'app non scrive nessun ciclo. Lo fa Spring AI dentro `ChatClient...call()`:
